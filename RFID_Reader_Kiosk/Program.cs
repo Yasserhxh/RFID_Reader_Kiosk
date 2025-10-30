@@ -492,7 +492,15 @@ public class Program
         var httpPort = builder.Configuration.GetValue<int>("App:HttpPort", 5000);
         builder.WebHost.UseUrls($"http://localhost:{httpPort}");
 
+        builder.Services.AddCors();
+
         var app = builder.Build();
+
+        app.UseCors(policy =>
+            policy
+        .AllowAnyOrigin()
+        .AllowAnyHeader()
+        .AllowAnyMethod());
 
         // HTTP Endpoint: GET /device-id
         app.MapGet("/device-id", () =>
