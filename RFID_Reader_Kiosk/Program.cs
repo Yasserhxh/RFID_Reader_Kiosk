@@ -6,10 +6,14 @@
 //   dotnet add package Microsoft.Azure.SignalR.Management
 //   dotnet add package Microsoft.Data.SqlClient
 //   dotnet add package Dapper
+//   dotnet add package Microsoft.AspNetCore.App (framework reference)
 //
 // Run: dotnet run
 
 using Dapper;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.SignalR;
 using Microsoft.Azure.SignalR.Management;
 using Microsoft.Data.SqlClient;
@@ -21,8 +25,10 @@ using Microsoft.Extensions.Options;
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.IO;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -32,7 +38,8 @@ using System.Threading.Tasks;
 public sealed class AppOptions
 {
     public bool TestMode { get; set; } = false;
-    public int TestIntervalMs { get; set; } = 60000; // publish every second in test mode
+    public int TestIntervalMs { get; set; } = 60000;
+    public int HttpPort { get; set; } = 5000; // HTTP endpoint port
 }
 
 public sealed class RfidOptions
@@ -54,18 +61,48 @@ public sealed class DbOptions
 public sealed class SignalROptions
 {
     public string ConnectionString { get; set; } = default!;
-
     public string HubName { get; set; } = "slv_hub";
     public string MethodName { get; set; } = "ReceiveRfid";
+}
 
-    //public string HubName { get; set; } = "slv_pabentry_hub";
-    //public string MethodName { get; set; } = "ReceivePabEntryRfid";
+#endregion
 
-    //public string HubName { get; set; } = "slv_loading_hub";
-    //public string MethodName { get; set; } = "ReceiveLoadingRfid";
+#region Device ID Manager
 
-    //public string HubName { get; set; } = "slv_pabexit_hub";
-    //public string MethodName { get; set; } = "ReceivePabExitRfid";
+public static class DeviceIdManager
+{
+    private static readonly string DeviceIdFile;
+    private static string? _cachedDeviceId;
+
+    static DeviceIdManager()
+    {
+        // Store file in the same directory as the executable/project
+        var baseDirectory = AppContext.BaseDirectory;
+        DeviceIdFile = Path.Combine(baseDirectory, "device.id.txt");
+    }
+
+    public static string GetOrCreateDeviceId()
+    {
+        if (_cachedDeviceId != null)
+            return _cachedDeviceId;
+
+        if (File.Exists(DeviceIdFile))
+        {
+            var existing = File.ReadAllText(DeviceIdFile).Trim();
+            if (!string.IsNullOrWhiteSpace(existing))
+            {
+                _cachedDeviceId = existing;
+                return existing;
+            }
+        }
+
+        var newId = Guid.NewGuid().ToString();
+        File.WriteAllText(DeviceIdFile, newId);
+        _cachedDeviceId = newId;
+        return newId;
+    }
+
+    public static string GetDeviceIdFilePath() => DeviceIdFile;
 }
 
 #endregion
@@ -248,36 +285,14 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
 
 #endregion
 
-#region SignalR publisher (single endpoint)
+#region SignalR Publisher
 
-// Add to Program.cs (top of file)
-public static class DeviceIdManager
-{
-    private const string DeviceIdFile = "device.id";
-
-    public static string GetOrCreateDeviceId()
-    {
-        if (File.Exists(DeviceIdFile))
-        {
-            var existing = File.ReadAllText(DeviceIdFile).Trim();
-            if (!string.IsNullOrWhiteSpace(existing))
-                return existing;
-        }
-
-        var newId = Guid.NewGuid().ToString();
-        File.WriteAllText(DeviceIdFile, newId);
-        return newId;
-    }
-}
 public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
 {
     private readonly ILogger<SignalRPublisher> _log;
     private readonly SignalROptions _opt;
     private ServiceManager? _mgr;
     private ServiceHubContext? _hub;
-
-    // Fixed device identifier for this console app instance
-
     private readonly string _deviceId;
 
     public SignalRPublisher(ILogger<SignalRPublisher> log, IOptions<SignalROptions> opt)
@@ -315,7 +330,7 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
         var payload = new
         {
             carteSlv,
-            deviceId = _deviceId, //dynamic
+            deviceId = _deviceId,
             tsUtc = DateTime.UtcNow
         };
 
@@ -329,159 +344,186 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
             _log.LogWarning(ex, "SignalR send failed");
         }
     }
+}
 
+#endregion
 
-    #endregion
+#region Resolver
 
-    #region Resolver (RFID -> DB -> SignalR) + Test Mode
+public sealed class RfidResolverService : IHostedService
+{
+    private readonly ILogger<RfidResolverService> _log;
+    private readonly RfidService _rfid;
+    private readonly IClientEquipementRepository _repo;
+    private readonly SignalRPublisher _signalR;
+    private readonly AppOptions _app;
+    private CancellationTokenSource? _manualCts;
 
-    public sealed class RfidResolverService : IHostedService
+    public RfidResolverService(
+        ILogger<RfidResolverService> log,
+        RfidService rfid,
+        IClientEquipementRepository repo,
+        SignalRPublisher signalR,
+        IOptions<AppOptions> app)
     {
-        private readonly ILogger<RfidResolverService> _log;
-        private readonly RfidService _rfid;
-        private readonly IClientEquipementRepository _repo;
-        private readonly SignalRPublisher _signalR;
-        private readonly AppOptions _app;
-        private CancellationTokenSource? _manualCts;
+        _log = log; _rfid = rfid; _repo = repo; _signalR = signalR; _app = app.Value;
+    }
 
-        public RfidResolverService(
-            ILogger<RfidResolverService> log,
-            RfidService rfid,
-            IClientEquipementRepository repo,
-            SignalRPublisher signalR,
-            IOptions<AppOptions> app)
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        if (_app.TestMode)
         {
-            _log = log; _rfid = rfid; _repo = repo; _signalR = signalR; _app = app.Value;
+            _manualCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _ = Task.Run(() => ManualInputLoopAsync(_manualCts.Token));
+            _log.LogWarning("TEST MODE (manual): type an SLV and press <Enter> to send. Empty line to quit test mode.");
         }
-
-        public Task StartAsync(CancellationToken cancellationToken)
+        else
         {
-            if (_app.TestMode)
-            {
-                _manualCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                _ = Task.Run(() => ManualInputLoopAsync(_manualCts.Token));
-                _log.LogWarning("TEST MODE (manual): type an SLV and press <Enter> to send. Empty line to quit test mode.");
-            }
-            else
-            {
-                _rfid.TagReceived += OnTag;
-                _log.LogInformation("Ready. Waiting for RFID tags…");
-            }
-            return Task.CompletedTask;
+            _rfid.TagReceived += OnTag;
+            _log.LogInformation("Ready. Waiting for RFID tags…");
         }
+        return Task.CompletedTask;
+    }
 
-        public Task StopAsync(CancellationToken cancellationToken)
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        if (_app.TestMode)
         {
-            if (_app.TestMode)
-            {
-                try { _manualCts?.Cancel(); } catch { }
-            }
-            else
-            {
-                _rfid.TagReceived -= OnTag;
-            }
-            return Task.CompletedTask;
+            try { _manualCts?.Cancel(); } catch { }
         }
-
-        // ---- Manual test loop (console) ----
-        private async Task ManualInputLoopAsync(CancellationToken ct)
+        else
         {
-            while (!ct.IsCancellationRequested)
-            {
-                Console.Write("\nEnter SLV (empty to exit test): ");
-                string? line;
-                try
-                {
-                    line = await Task.Run(Console.ReadLine, ct);
-                }
-                catch (OperationCanceledException) { break; }
-
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    _log.LogInformation("Leaving TEST MODE (manual).");
-                    break;
-                }
-
-                var slv = line.Trim();
-                _log.LogInformation("Sending manual SLV='{slv}'", slv);
-                await _signalR.PublishRfidAsync(slv);
-            }
+            _rfid.TagReceived -= OnTag;
         }
+        return Task.CompletedTask;
+    }
 
-        // ---- Production path (RFID device) ----
-        private async void OnTag(object? sender, TagEventArgs e)
+    private async Task ManualInputLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
         {
+            Console.Write("\nEnter SLV (empty to exit test): ");
+            string? line;
             try
             {
-                var slv = await _repo.GetCarteSlvByRfidHexAsync(e.HexCanonical, CancellationToken.None);
-                if (slv is null)
-                    Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> NOT FOUND");
-                else
-                    Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> CarteSLV={slv}");
-                await _signalR.PublishRfidAsync(slv);
+                line = await Task.Run(Console.ReadLine, ct);
             }
-            catch (Exception ex)
-            { _log.LogError(ex, "Lookup/send failed for HEX={hex}", e.HexCanonical); }
+            catch (OperationCanceledException) { break; }
+
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                _log.LogInformation("Leaving TEST MODE (manual).");
+                break;
+            }
+
+            var slv = line.Trim();
+            _log.LogInformation("Sending manual SLV='{slv}'", slv);
+            await _signalR.PublishRfidAsync(slv);
         }
     }
 
-    #endregion
-
-    #region Program
-
-    public class Program
+    private async void OnTag(object? sender, TagEventArgs e)
     {
-        public static async Task Main(string[] args)
+        try
         {
-            using var host = Host.CreateDefaultBuilder(args)
-                .ConfigureAppConfiguration(cfg =>
-                {
-                    cfg.AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-                       .AddJsonFile("appsettings.Development.json", optional: true)
-                       .AddEnvironmentVariables();
-                })
-                .ConfigureServices((ctx, services) =>
-                {
-                    services.Configure<AppOptions>(ctx.Configuration.GetSection("App"));
-                    services.Configure<RfidOptions>(ctx.Configuration.GetSection("Rfid"));
-                    services.Configure<DbOptions>(opt =>
-                    {
-                        opt.ConnectionString = ctx.Configuration.GetConnectionString("SqlServer")
-                                             ?? throw new InvalidOperationException("ConnectionStrings:SqlServer missing");
-                        var table = ctx.Configuration["Db:ClientEquipementsTable"];
-                        if (!string.IsNullOrWhiteSpace(table)) opt.ClientEquipementsTable = table!;
-                    });
-                    services.Configure<SignalROptions>(ctx.Configuration.GetSection("SignalR"));
-
-                    // Always register singletons
-                    services.AddSingleton<RfidService>();
-                    services.AddSingleton<IClientEquipementRepository, ClientEquipementRepository>();
-                    services.AddSingleton<SignalRPublisher>();
-                    services.AddSingleton<RfidResolverService>();
-
-                    // Hosted services:
-                    services.AddHostedService(sp => sp.GetRequiredService<SignalRPublisher>()); // warm hub
-
-                    var isTest = ctx.Configuration.GetValue<bool>("App:TestMode");
-                    if (!isTest)
-                    {
-                        // Only run RFID reader when not in test mode
-                        services.AddHostedService(sp => sp.GetRequiredService<RfidService>());
-                    }
-
-                    services.AddHostedService(sp => sp.GetRequiredService<RfidResolverService>());
-                })
-                .ConfigureLogging(logging =>
-                {
-                    logging.ClearProviders();
-                    logging.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; });
-                    logging.SetMinimumLevel(LogLevel.Information);
-                })
-                .Build();
-
-            Console.WriteLine("RFID → SQL (CarteSLV) → Azure SignalR (slv_hub). Ctrl+C to exit.");
-            await host.RunAsync();
+            var slv = await _repo.GetCarteSlvByRfidHexAsync(e.HexCanonical, CancellationToken.None);
+            if (slv is null)
+                Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> NOT FOUND");
+            else
+                Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> CarteSLV={slv}");
+            await _signalR.PublishRfidAsync(slv);
         }
+        catch (Exception ex)
+        { _log.LogError(ex, "Lookup/send failed for HEX={hex}", e.HexCanonical); }
+    }
+}
+
+#endregion
+
+#region Program
+
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var builder = WebApplication.CreateBuilder(args);
+
+        // Configuration
+        builder.Configuration
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+            .AddJsonFile("appsettings.Development.json", optional: true)
+            .AddEnvironmentVariables();
+
+        // Configure services
+        builder.Services.Configure<AppOptions>(builder.Configuration.GetSection("App"));
+        builder.Services.Configure<RfidOptions>(builder.Configuration.GetSection("Rfid"));
+        builder.Services.Configure<DbOptions>(opt =>
+        {
+            opt.ConnectionString = builder.Configuration.GetConnectionString("SqlServer")
+                                 ?? throw new InvalidOperationException("ConnectionStrings:SqlServer missing");
+            var table = builder.Configuration["Db:ClientEquipementsTable"];
+            if (!string.IsNullOrWhiteSpace(table)) opt.ClientEquipementsTable = table!;
+        });
+        builder.Services.Configure<SignalROptions>(builder.Configuration.GetSection("SignalR"));
+
+        // Singletons
+        builder.Services.AddSingleton<RfidService>();
+        builder.Services.AddSingleton<IClientEquipementRepository, ClientEquipementRepository>();
+        builder.Services.AddSingleton<SignalRPublisher>();
+        builder.Services.AddSingleton<RfidResolverService>();
+
+        // Hosted services
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<SignalRPublisher>());
+
+        var isTest = builder.Configuration.GetValue<bool>("App:TestMode");
+        if (!isTest)
+        {
+            builder.Services.AddHostedService(sp => sp.GetRequiredService<RfidService>());
+        }
+
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<RfidResolverService>());
+
+        // Logging
+        builder.Logging.ClearProviders();
+        builder.Logging.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; });
+        builder.Logging.SetMinimumLevel(LogLevel.Information);
+
+        // Configure HTTP port
+        var httpPort = builder.Configuration.GetValue<int>("App:HttpPort", 5000);
+        builder.WebHost.UseUrls($"http://localhost:{httpPort}");
+
+        var app = builder.Build();
+
+        // HTTP Endpoint: GET /device-id
+        app.MapGet("/device-id", () =>
+        {
+            var deviceId = DeviceIdManager.GetOrCreateDeviceId();
+            var filePath = DeviceIdManager.GetDeviceIdFilePath();
+
+            return Results.Json(new
+            {
+                deviceId,
+                filePath,
+                timestamp = DateTime.UtcNow
+            });
+        });
+
+        // Root endpoint
+        app.MapGet("/", () => Results.Json(new
+        {
+            message = "RFID Service API",
+            endpoints = new[]
+            {
+                "/device-id - Get device identifier"
+            }
+        }));
+
+        Console.WriteLine("RFID → SQL (CarteSLV) → Azure SignalR (slv_hub)");
+        Console.WriteLine($"HTTP API listening on http://localhost:{httpPort}");
+        Console.WriteLine($"Device ID file: {DeviceIdManager.GetDeviceIdFilePath()}");
+        Console.WriteLine("Ctrl+C to exit.");
+
+        await app.RunAsync();
     }
 }
 
