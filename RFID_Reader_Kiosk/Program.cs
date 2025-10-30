@@ -337,7 +337,7 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
             _log.LogWarning(ex, "AddToGroupAsync failed (ok until the first client connects).");
         }
 
-        // --- Start loopback endpoint: GET http://127.0.0.1:5858/device-proof ---
+        // --- Start loopback endpoint: GET http://127.0.0.1:9191/device-proof ---
         StartLoopbackProofServer();
     }
 
@@ -402,11 +402,11 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
     private void StartLoopbackProofServer()
     {
         _listener = new HttpListener();
-        _listener.Prefixes.Add("http://127.0.0.1:5858/");
+        _listener.Prefixes.Add("http://127.0.0.1:9191/");
         _listener.Start();
         _ = Task.Run(async () =>
         {
-            _log.LogInformation("Loopback proof server listening at http://127.0.0.1:5858/");
+            _log.LogInformation("Loopback proof server listening at http://127.0.0.1:9191/");
             while (_listener.IsListening)
             {
                 HttpListenerContext? ctx = null;
@@ -458,7 +458,7 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
         });
 
         // If you get 403 once on Windows:
-        //   netsh http add urlacl url=http://127.0.0.1:5858/ user=Everyone
+        //   netsh http add urlacl url=http://127.0.0.1:9191/ user=Everyone
     }
 
     private void StopLoopbackProofServer()
