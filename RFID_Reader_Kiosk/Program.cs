@@ -26,6 +26,8 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Security.Cryptography;
+using System.Net;
 
 #region Options
 
@@ -251,24 +253,35 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
 #region SignalR publisher (single endpoint)
 
 // Add to Program.cs (top of file)
-public static class DeviceIdManager
+// --- Device identity (id + secret) persisted to files ---
+public static class DeviceIdentity
 {
     private const string DeviceIdFile = "device.id";
+    private const string DeviceSecretFile = "device.secret";
 
-    public static string GetOrCreateDeviceId()
+    public static (string deviceId, byte[] secret) GetOrCreate()
     {
-        if (File.Exists(DeviceIdFile))
+        string deviceId;
+        byte[] secret;
+
+        if (File.Exists(DeviceIdFile) && File.Exists(DeviceSecretFile))
         {
-            var existing = File.ReadAllText(DeviceIdFile).Trim();
-            if (!string.IsNullOrWhiteSpace(existing))
-                return existing;
+            deviceId = File.ReadAllText(DeviceIdFile).Trim();
+            var secretHex = File.ReadAllText(DeviceSecretFile).Trim();
+            secret = Convert.FromHexString(secretHex);
+            if (!string.IsNullOrWhiteSpace(deviceId) && secret.Length == 32)
+                return (deviceId, secret);
         }
 
-        var newId = Guid.NewGuid().ToString();
-        File.WriteAllText(DeviceIdFile, newId);
-        return newId;
+        deviceId = Guid.NewGuid().ToString("N");
+        secret = RandomNumberGenerator.GetBytes(32); // 256-bit
+
+        File.WriteAllText(DeviceIdFile, deviceId);
+        File.WriteAllText(DeviceSecretFile, Convert.ToHexString(secret));
+        return (deviceId, secret);
     }
 }
+
 public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
 {
     private readonly ILogger<SignalRPublisher> _log;
@@ -276,15 +289,25 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
     private ServiceManager? _mgr;
     private ServiceHubContext? _hub;
 
-    // Fixed device identifier for this console app instance
-
     private readonly string _deviceId;
+    private readonly byte[] _deviceSecret;
+    private string GroupName => $"device:{_deviceId}";
+
+    // loopback proof server
+    private HttpListener? _listener;
+
+    // === Registry API (same shape you used) ===
+    private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(5) };
+    private const string ApiBase = "http://172-189-107-115.nip.io/signalrapi";
+    private const string RegistryEndpoint = ApiBase + "/api/device/register";
+    private const string RegistryAdminKey = "dev-admin-key"; // align with your API
 
     public SignalRPublisher(ILogger<SignalRPublisher> log, IOptions<SignalROptions> opt)
     {
         _log = log;
         _opt = opt.Value;
-        _deviceId = DeviceIdManager.GetOrCreateDeviceId();
+
+        (_deviceId, _deviceSecret) = DeviceIdentity.GetOrCreate();
         _log.LogInformation("Device ID: {deviceId}", _deviceId);
     }
 
@@ -299,15 +322,37 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
 
         _hub = await _mgr.CreateHubContextAsync(_opt.HubName, cancellationToken);
         _log.LogInformation("SignalR hub context ready for {Hub}", _opt.HubName);
+
+        // --- Register device with your backend so it can validate proofs ---
+        await RegisterDeviceAsync();
+
+        // --- Bind userId=deviceId to the per-device group (no CreateUserGroupManager needed) ---
+        try
+        {
+            await _hub.UserGroups.AddToGroupAsync(_deviceId, GroupName, cancellationToken);
+            _log.LogInformation("Bound userId={user} to group={group}", _deviceId, GroupName);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "AddToGroupAsync failed (ok until the first client connects).");
+        }
+
+        // --- Start loopback endpoint: GET http://127.0.0.1:5858/device-proof ---
+        StartLoopbackProofServer();
     }
 
-    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public Task StopAsync(CancellationToken cancellationToken)
+    {
+        StopLoopbackProofServer();
+        return Task.CompletedTask;
+    }
 
     public async ValueTask DisposeAsync()
     {
         if (_hub is not null) await _hub.DisposeAsync();
     }
 
+    // === Called by your resolver; now sends to per-device group on ReceiveRfid ===
     public async Task PublishRfidAsync(string? carteSlv)
     {
         if (_hub is null) return;
@@ -315,14 +360,14 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
         var payload = new
         {
             carteSlv,
-            deviceId = _deviceId, //dynamic
+            deviceId = _deviceId,
             tsUtc = DateTime.UtcNow
         };
 
         try
         {
-            await _hub.Clients.All.SendAsync(_opt.MethodName, payload);
-            _log.LogInformation("📡 Sent via SignalR: {payload}", payload);
+            await _hub.Clients.Group(GroupName).SendAsync(_opt.MethodName, payload);
+            _log.LogInformation("📡 Sent via SignalR to {group}: {payload}", GroupName, payload);
         }
         catch (Exception ex)
         {
@@ -330,6 +375,98 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
         }
     }
 
+    // === Your requested method: register device (exact logic you showed) ===
+    private async Task RegisterDeviceAsync()
+    {
+        try
+        {
+            var payload = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                DeviceId = _deviceId,
+                SecretHex = Convert.ToHexString(_deviceSecret)
+            });
+            using var req = new HttpRequestMessage(HttpMethod.Post, RegistryEndpoint);
+            req.Headers.Add("X-Api-Key", RegistryAdminKey);
+            req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+            var resp = await _http.SendAsync(req);
+            resp.EnsureSuccessStatusCode();
+            _log.LogInformation("Device registered with API");
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Device registration failed; API won't be able to validate proof.");
+        }
+    }
+
+    // === Loopback proof server (device-proof) ===
+    private void StartLoopbackProofServer()
+    {
+        _listener = new HttpListener();
+        _listener.Prefixes.Add("http://127.0.0.1:5858/");
+        _listener.Start();
+        _ = Task.Run(async () =>
+        {
+            _log.LogInformation("Loopback proof server listening at http://127.0.0.1:5858/");
+            while (_listener.IsListening)
+            {
+                HttpListenerContext? ctx = null;
+                try
+                {
+                    ctx = await _listener.GetContextAsync();
+
+                    var origin = ctx.Request.Headers["Origin"];
+                    ctx.Response.AddHeader("Access-Control-Allow-Origin", string.IsNullOrEmpty(origin) ? "*" : origin);
+                    ctx.Response.AddHeader("Vary", "Origin");
+                    ctx.Response.AddHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+                    ctx.Response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+
+                    if (ctx.Request.HttpMethod == "OPTIONS")
+                    {
+                        ctx.Response.StatusCode = 200;
+                        ctx.Response.Close();
+                        continue;
+                    }
+
+                    if (ctx.Request.HttpMethod == "GET" && ctx.Request.Url?.AbsolutePath == "/device-proof")
+                    {
+                        var ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+                        var nonce = Guid.NewGuid().ToString("N");
+                        var msg = $"{_deviceId}.{ts}.{nonce}";
+                        using var h = new HMACSHA256(_deviceSecret);
+                        var sigBytes = h.ComputeHash(Encoding.UTF8.GetBytes(msg));
+                        var sigHex = Convert.ToHexString(sigBytes);
+
+                        var json = $"{{\"deviceId\":\"{_deviceId}\",\"ts\":\"{ts}\",\"nonce\":\"{nonce}\",\"sig\":\"{sigHex}\"}}";
+                        var bytes = Encoding.UTF8.GetBytes(json);
+
+                        ctx.Response.StatusCode = 200;
+                        ctx.Response.ContentType = "application/json; charset=utf-8";
+                        await ctx.Response.OutputStream.WriteAsync(bytes, 0, bytes.Length);
+                        ctx.Response.Close();
+                        continue;
+                    }
+
+                    ctx.Response.StatusCode = 404;
+                    ctx.Response.Close();
+                }
+                catch (Exception ex)
+                {
+                    try { ctx?.Response.Close(); } catch { }
+                    _log.LogDebug(ex, "Loopback proof server request failed.");
+                }
+            }
+        });
+
+        // If you get 403 once on Windows:
+        //   netsh http add urlacl url=http://127.0.0.1:5858/ user=Everyone
+    }
+
+    private void StopLoopbackProofServer()
+    {
+        try { _listener?.Stop(); } catch { }
+        try { _listener?.Close(); } catch { }
+        _listener = null;
+    }
 
     #endregion
 
