@@ -1,14 +1,7 @@
 ﻿// Program.cs
 // .NET 8 Console App — RFID -> SQL Server (Dapper) -> Azure SignalR (slv_hub)
-// Test mode: when App:TestMode = true, publish CarteSLV="4421" on a timer (no RFID/DB)
-//
-// Packages:
-//   dotnet add package Microsoft.Azure.SignalR.Management
-//   dotnet add package Microsoft.Data.SqlClient
-//   dotnet add package Dapper
-//   dotnet add package Microsoft.AspNetCore.App (framework reference)
-//
-// Run: dotnet run
+// Adds Device Name support: persists deviceId (device.id.txt) + deviceName (device.name.txt)
+// On first run, upserts into dbo.Ecare_Device (Alias = deviceName)
 
 using Dapper;
 using Microsoft.AspNetCore.Builder;
@@ -61,30 +54,38 @@ public sealed class DbOptions
 public sealed class SignalROptions
 {
     public string ConnectionString { get; set; } = default!;
-    public string HubName { get; set; } = "slv_hub";
-    public string MethodName { get; set; } = "ReceiveRfid";
+    public string HubName { get; set; } = "slv_loading_hub";
+    public string MethodName { get; set; } = "ReceiveLoadingRfid";
+}
+
+public sealed class DeviceOptions
+{
+    // Optional: set in appsettings.json: "Device": { "Name": "kiosk-loading-01", "Site": "Asment-Temara-01" }
+    public string? Name { get; set; }
+    public string? Site { get; set; }
 }
 
 #endregion
 
-#region Device ID Manager
+#region Device Identity (ID + Name)
 
-public static class DeviceIdManager
+public static class DeviceIdentity
 {
     private static readonly string DeviceIdFile;
+    private static readonly string DeviceNameFile;
     private static string? _cachedDeviceId;
+    private static string? _cachedDeviceName;
 
-    static DeviceIdManager()
+    static DeviceIdentity()
     {
-        // Store file in the same directory as the executable/project
         var baseDirectory = AppContext.BaseDirectory;
         DeviceIdFile = Path.Combine(baseDirectory, "device.id.txt");
+        DeviceNameFile = Path.Combine(baseDirectory, "device.name.txt");
     }
 
     public static string GetOrCreateDeviceId()
     {
-        if (_cachedDeviceId != null)
-            return _cachedDeviceId;
+        if (_cachedDeviceId != null) return _cachedDeviceId;
 
         if (File.Exists(DeviceIdFile))
         {
@@ -102,7 +103,32 @@ public static class DeviceIdManager
         return newId;
     }
 
-    public static string GetDeviceIdFilePath() => DeviceIdFile;
+    public static string GetOrCreateDeviceName(string? configuredName = null)
+    {
+        if (_cachedDeviceName != null) return _cachedDeviceName;
+
+        if (File.Exists(DeviceNameFile))
+        {
+            var existing = File.ReadAllText(DeviceNameFile).Trim();
+            if (!string.IsNullOrWhiteSpace(existing))
+            {
+                _cachedDeviceName = existing;
+                return existing;
+            }
+        }
+
+        var deviceId = GetOrCreateDeviceId();
+        var last4 = deviceId.Length >= 4 ? deviceId[^4..] : deviceId;
+        var defaultName = $"kiosk-loading-{last4}".ToLowerInvariant();
+
+        var name = string.IsNullOrWhiteSpace(configuredName) ? defaultName : configuredName.Trim();
+        File.WriteAllText(DeviceNameFile, name);
+        _cachedDeviceName = name;
+        return name;
+    }
+
+    public static string GetDeviceIdPath() => DeviceIdFile;
+    public static string GetDeviceNamePath() => DeviceNameFile;
 }
 
 #endregion
@@ -294,13 +320,15 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
     private ServiceManager? _mgr;
     private ServiceHubContext? _hub;
     private readonly string _deviceId;
+    private readonly string _deviceName;
 
-    public SignalRPublisher(ILogger<SignalRPublisher> log, IOptions<SignalROptions> opt)
+    public SignalRPublisher(ILogger<SignalRPublisher> log, IOptions<SignalROptions> opt, IOptions<DeviceOptions> devOpt)
     {
         _log = log;
         _opt = opt.Value;
-        _deviceId = DeviceIdManager.GetOrCreateDeviceId();
-        _log.LogInformation("Device ID: {deviceId}", _deviceId);
+        _deviceId = DeviceIdentity.GetOrCreateDeviceId();
+        _deviceName = DeviceIdentity.GetOrCreateDeviceName(devOpt.Value.Name);
+        _log.LogInformation("Device ID: {deviceId} | Device Name: {deviceName}", _deviceId, _deviceName);
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
@@ -331,6 +359,7 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
         {
             carteSlv,
             deviceId = _deviceId,
+            deviceName = _deviceName,
             tsUtc = DateTime.UtcNow
         };
 
@@ -344,6 +373,62 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
             _log.LogWarning(ex, "SignalR send failed");
         }
     }
+}
+
+#endregion
+
+#region Device Registration (first run → save to dbo.Ecare_Device)
+
+public sealed class DeviceRegistrationService : IHostedService
+{
+    private readonly ILogger<DeviceRegistrationService> _log;
+    private readonly DbOptions _db;
+    private readonly DeviceOptions _dev;
+
+    public DeviceRegistrationService(ILogger<DeviceRegistrationService> log, IOptions<DbOptions> db, IOptions<DeviceOptions> dev)
+    { _log = log; _db = db.Value; _dev = dev.Value; }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        var deviceId = DeviceIdentity.GetOrCreateDeviceId();
+        var deviceName = DeviceIdentity.GetOrCreateDeviceName(_dev.Name);
+        var host = Environment.MachineName;
+        var appVersion = typeof(Program).Assembly.GetName().Version?.ToString() ?? "1.0.0";
+
+        const string upsertDevice = """
+        MERGE dbo.Ecare_Device AS t
+        USING (SELECT @DeviceId AS DeviceId) AS s
+        ON (t.DeviceId = s.DeviceId)
+        WHEN MATCHED THEN UPDATE SET
+            Alias = @DeviceName,
+            HostName = COALESCE(@HostName, t.HostName),
+            AppVersion = @AppVersion,
+            UpdatedAtUtc = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN INSERT (DeviceId, Alias, HostName, AppVersion)
+        VALUES (@DeviceId, @DeviceName, @HostName, @AppVersion);
+        """;
+
+        try
+        {
+            using var conn = new SqlConnection(_db.ConnectionString);
+            await conn.OpenAsync(cancellationToken);
+            await conn.ExecuteAsync(new CommandDefinition(upsertDevice, new
+            {
+                DeviceId = deviceId,
+                DeviceName = deviceName,
+                HostName = host,
+                AppVersion = appVersion
+            }, cancellationToken: cancellationToken));
+
+            _log.LogInformation("Device registered: {deviceId} as '{deviceName}' (host {host})", deviceId, deviceName, host);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "Failed to register device info in dbo.Ecare_Device");
+        }
+    }
+
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 }
 
 #endregion
@@ -454,9 +539,10 @@ public class Program
             .AddJsonFile("appsettings.Development.json", optional: true)
             .AddEnvironmentVariables();
 
-        // Configure services
+        // Configure options
         builder.Services.Configure<AppOptions>(builder.Configuration.GetSection("App"));
         builder.Services.Configure<RfidOptions>(builder.Configuration.GetSection("Rfid"));
+        builder.Services.Configure<DeviceOptions>(builder.Configuration.GetSection("Device"));
         builder.Services.Configure<DbOptions>(opt =>
         {
             opt.ConnectionString = builder.Configuration.GetConnectionString("SqlServer")
@@ -474,6 +560,7 @@ public class Program
 
         // Hosted services
         builder.Services.AddHostedService(sp => sp.GetRequiredService<SignalRPublisher>());
+        builder.Services.AddHostedService<DeviceRegistrationService>(); // <-- registers DeviceId + DeviceName on first run
 
         var isTest = builder.Configuration.GetValue<bool>("App:TestMode");
         if (!isTest)
@@ -505,13 +592,29 @@ public class Program
         // HTTP Endpoint: GET /device-id
         app.MapGet("/device-id", () =>
         {
-            var deviceId = DeviceIdManager.GetOrCreateDeviceId();
-            var filePath = DeviceIdManager.GetDeviceIdFilePath();
+            var deviceId = DeviceIdentity.GetOrCreateDeviceId();
+            var filePath = DeviceIdentity.GetDeviceIdPath();
 
             return Results.Json(new
             {
                 deviceId,
                 filePath,
+                timestamp = DateTime.UtcNow
+            });
+        });
+
+        // HTTP Endpoint: GET /device-info  (includes name)
+        app.MapGet("/device-info", (IOptions<DeviceOptions> devOpt) =>
+        {
+            var deviceId = DeviceIdentity.GetOrCreateDeviceId();
+            var deviceName = DeviceIdentity.GetOrCreateDeviceName(devOpt.Value.Name);
+            return Results.Json(new
+            {
+                deviceId,
+                deviceName,
+                idFile = DeviceIdentity.GetDeviceIdPath(),
+                nameFile = DeviceIdentity.GetDeviceNamePath(),
+                hostName = Environment.MachineName,
                 timestamp = DateTime.UtcNow
             });
         });
@@ -522,13 +625,15 @@ public class Program
             message = "RFID Service API",
             endpoints = new[]
             {
-                "/device-id - Get device identifier"
+                "/device-id   - Get device identifier",
+                "/device-info - Get device id & name"
             }
         }));
 
         Console.WriteLine("RFID → SQL (CarteSLV) → Azure SignalR (slv_hub)");
         Console.WriteLine($"HTTP API listening on http://localhost:{httpPort}");
-        Console.WriteLine($"Device ID file: {DeviceIdManager.GetDeviceIdFilePath()}");
+        Console.WriteLine($"Device ID file:   {DeviceIdentity.GetDeviceIdPath()}");
+        Console.WriteLine($"Device Name file: {DeviceIdentity.GetDeviceNamePath()}");
         Console.WriteLine("Ctrl+C to exit.");
 
         await app.RunAsync();
