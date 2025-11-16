@@ -1,7 +1,6 @@
-﻿// Program.cs
-// .NET 8 Console App — RFID -> SQL Server (Dapper) -> Azure SignalR (slv_hub)
-// Adds Device Name support: persists deviceId (device.id.txt) + deviceName (device.name.txt)
-// On first run, upserts into dbo.Ecare_Device (Alias = deviceName)
+﻿// .NET 8 Console/Minimal API — RFID -> SQL Server (Dapper) -> Azure SignalR
+// Single EXE, embedded PDB, embedded appsettings.json
+// DeviceId is ALWAYS generated on first run (GUID) then persisted; no ForceDeviceId support.
 
 using Dapper;
 using Microsoft.AspNetCore.Builder;
@@ -15,16 +14,12 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using System;
 using System.Buffers;
-using System.Collections.Generic;
-using System.IO;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 
 #region Options
 
@@ -32,7 +27,8 @@ public sealed class AppOptions
 {
     public bool TestMode { get; set; } = false;
     public int TestIntervalMs { get; set; } = 60000;
-    public int HttpPort { get; set; } = 5000; // HTTP endpoint port
+    public int HttpPort { get; set; } = 5003;
+    // ForceDeviceId removed
 }
 
 public sealed class RfidOptions
@@ -60,14 +56,13 @@ public sealed class SignalROptions
 
 public sealed class DeviceOptions
 {
-    // Optional: set in appsettings.json: "Device": { "Name": "kiosk-loading-01", "Site": "Asment-Temara-01" }
     public string? Name { get; set; }
     public string? Site { get; set; }
 }
 
 #endregion
 
-#region Device Identity (ID + Name)
+#region Device Identity
 
 public static class DeviceIdentity
 {
@@ -85,7 +80,7 @@ public static class DeviceIdentity
 
     public static string GetOrCreateDeviceId()
     {
-        if (_cachedDeviceId != null) return _cachedDeviceId;
+        if (_cachedDeviceId is not null) return _cachedDeviceId;
 
         if (File.Exists(DeviceIdFile))
         {
@@ -105,7 +100,7 @@ public static class DeviceIdentity
 
     public static string GetOrCreateDeviceName(string? configuredName = null)
     {
-        if (_cachedDeviceName != null) return _cachedDeviceName;
+        if (_cachedDeviceName is not null) return _cachedDeviceName;
 
         if (File.Exists(DeviceNameFile))
         {
@@ -119,7 +114,7 @@ public static class DeviceIdentity
 
         var deviceId = GetOrCreateDeviceId();
         var last4 = deviceId.Length >= 4 ? deviceId[^4..] : deviceId;
-        var defaultName = $"kiosk-loading-{last4}".ToLowerInvariant();
+        var defaultName = $"kiosk--{last4}".ToLowerInvariant();
 
         var name = string.IsNullOrWhiteSpace(configuredName) ? defaultName : configuredName.Trim();
         File.WriteAllText(DeviceNameFile, name);
@@ -133,7 +128,7 @@ public static class DeviceIdentity
 
 #endregion
 
-#region RFID
+#region RFID service
 
 public sealed class TagEventArgs : EventArgs
 {
@@ -188,6 +183,7 @@ public sealed class RfidService : IHostedService
                     while (!ct.IsCancellationRequested)
                     {
                         if (!stream.DataAvailable) { await Task.Delay(5, ct); continue; }
+
                         int n = await stream.ReadAsync(buffer.AsMemory(0, _opt.ReadBufferBytes), ct);
                         if (n <= 0) throw new IOException("RFID remote closed");
 
@@ -272,7 +268,7 @@ public sealed class RfidService : IHostedService
 
 #endregion
 
-#region Repository
+#region Repo
 
 public interface IClientEquipementRepository
 {
@@ -296,7 +292,7 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
             """;
 
         var sql = sqlTemplate.Replace("{TABLE}", _opt.ClientEquipementsTable);
-        using var conn = new SqlConnection(_opt.ConnectionString);
+        await using var conn = new SqlConnection(_opt.ConnectionString);
         await conn.OpenAsync(ct);
 
         var slv = await conn.QueryFirstOrDefaultAsync<string?>(new CommandDefinition(
@@ -317,17 +313,23 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
 {
     private readonly ILogger<SignalRPublisher> _log;
     private readonly SignalROptions _opt;
+    private readonly DeviceOptions _dev;
     private ServiceManager? _mgr;
     private ServiceHubContext? _hub;
     private readonly string _deviceId;
     private readonly string _deviceName;
 
-    public SignalRPublisher(ILogger<SignalRPublisher> log, IOptions<SignalROptions> opt, IOptions<DeviceOptions> devOpt)
+    public SignalRPublisher(
+        ILogger<SignalRPublisher> log,
+        IOptions<SignalROptions> opt,
+        IOptions<DeviceOptions> dev)
     {
         _log = log;
         _opt = opt.Value;
+        _dev = dev.Value;
+
         _deviceId = DeviceIdentity.GetOrCreateDeviceId();
-        _deviceName = DeviceIdentity.GetOrCreateDeviceName(devOpt.Value.Name);
+        _deviceName = DeviceIdentity.GetOrCreateDeviceName(_dev.Name);
         _log.LogInformation("Device ID: {deviceId} | Device Name: {deviceName}", _deviceId, _deviceName);
     }
 
@@ -349,6 +351,7 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (_hub is not null) await _hub.DisposeAsync();
+        _mgr?.Dispose();
     }
 
     public async Task PublishRfidAsync(string? carteSlv)
@@ -365,8 +368,9 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
 
         try
         {
+            // To scope per device: await _hub.Clients.Group($"device:{_deviceId}").SendAsync(_opt.MethodName, payload);
             await _hub.Clients.All.SendAsync(_opt.MethodName, payload);
-            _log.LogInformation("📡 Sent via SignalR: {payload}", payload);
+            _log.LogInformation("📡 Sent via SignalR: {payload}", JsonSerializer.Serialize(payload));
         }
         catch (Exception ex)
         {
@@ -377,7 +381,7 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
 
 #endregion
 
-#region Device Registration (first run → save to dbo.Ecare_Device)
+#region Device registration
 
 public sealed class DeviceRegistrationService : IHostedService
 {
@@ -410,7 +414,7 @@ public sealed class DeviceRegistrationService : IHostedService
 
         try
         {
-            using var conn = new SqlConnection(_db.ConnectionString);
+            await using var conn = new SqlConnection(_db.ConnectionString);
             await conn.OpenAsync(cancellationToken);
             await conn.ExecuteAsync(new CommandDefinition(upsertDevice, new
             {
@@ -433,7 +437,7 @@ public sealed class DeviceRegistrationService : IHostedService
 
 #endregion
 
-#region Resolver
+#region Resolver service
 
 public sealed class RfidResolverService : IHostedService
 {
@@ -451,7 +455,11 @@ public sealed class RfidResolverService : IHostedService
         SignalRPublisher signalR,
         IOptions<AppOptions> app)
     {
-        _log = log; _rfid = rfid; _repo = repo; _signalR = signalR; _app = app.Value;
+        _log = log;
+        _rfid = rfid;
+        _repo = repo;
+        _signalR = signalR;
+        _app = app.Value;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
@@ -460,7 +468,7 @@ public sealed class RfidResolverService : IHostedService
         {
             _manualCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _ = Task.Run(() => ManualInputLoopAsync(_manualCts.Token));
-            _log.LogWarning("TEST MODE (manual): type an SLV and press <Enter> to send. Empty line to quit test mode.");
+            _log.LogWarning("TEST MODE (manual): type an SLV and press <Enter> to send.");
         }
         else
         {
@@ -489,10 +497,7 @@ public sealed class RfidResolverService : IHostedService
         {
             Console.Write("\nEnter SLV (empty to exit test): ");
             string? line;
-            try
-            {
-                line = await Task.Run(Console.ReadLine, ct);
-            }
+            try { line = await Task.Run(Console.ReadLine!, ct); }
             catch (OperationCanceledException) { break; }
 
             if (string.IsNullOrWhiteSpace(line))
@@ -519,27 +524,62 @@ public sealed class RfidResolverService : IHostedService
             await _signalR.PublishRfidAsync(slv);
         }
         catch (Exception ex)
-        { _log.LogError(ex, "Lookup/send failed for HEX={hex}", e.HexCanonical); }
+        {
+            _log.LogError(ex, "Lookup/send failed for HEX={hex}", e.HexCanonical);
+        }
     }
 }
 
 #endregion
 
-#region Program
+#region Config + Program
+
+static class ConfigLoader
+{
+    public static IConfiguration BuildWithEmbeddedFallback()
+    {
+        var baseDir = AppContext.BaseDirectory;
+        var external = Path.Combine(baseDir, "appsettings.json");
+
+        var cb = new ConfigurationBuilder().SetBasePath(baseDir).AddEnvironmentVariables();
+
+        if (File.Exists(external))
+        {
+            cb.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
+            cb.AddJsonFile("appsettings.Development.json", optional: true);
+            Console.WriteLine("Config source: external appsettings.json");
+        }
+        else
+        {
+            var asm = Assembly.GetExecutingAssembly();
+            var name = asm.GetManifestResourceNames()
+                          .FirstOrDefault(n => n.EndsWith("appsettings.json", StringComparison.OrdinalIgnoreCase));
+            if (name is not null)
+            {
+                using var stream = asm.GetManifestResourceStream(name)!;
+                cb.AddJsonStream(stream);
+                Console.WriteLine("Config source: embedded appsettings.json");
+            }
+            else
+            {
+                Console.WriteLine("Config source: environment only (no appsettings.json found).");
+            }
+        }
+
+        return cb.Build();
+    }
+}
 
 public class Program
 {
     public static async Task Main(string[] args)
     {
+        var configuration = ConfigLoader.BuildWithEmbeddedFallback();
+
         var builder = WebApplication.CreateBuilder(args);
+        builder.Configuration.AddConfiguration(configuration);
 
-        // Configuration
-        builder.Configuration
-            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-            .AddJsonFile("appsettings.Development.json", optional: true)
-            .AddEnvironmentVariables();
-
-        // Configure options
+        // options
         builder.Services.Configure<AppOptions>(builder.Configuration.GetSection("App"));
         builder.Services.Configure<RfidOptions>(builder.Configuration.GetSection("Rfid"));
         builder.Services.Configure<DeviceOptions>(builder.Configuration.GetSection("Device"));
@@ -552,58 +592,55 @@ public class Program
         });
         builder.Services.Configure<SignalROptions>(builder.Configuration.GetSection("SignalR"));
 
-        // Singletons
+        // services
         builder.Services.AddSingleton<RfidService>();
         builder.Services.AddSingleton<IClientEquipementRepository, ClientEquipementRepository>();
         builder.Services.AddSingleton<SignalRPublisher>();
         builder.Services.AddSingleton<RfidResolverService>();
 
-        // Hosted services
+        // hosted
         builder.Services.AddHostedService(sp => sp.GetRequiredService<SignalRPublisher>());
-        builder.Services.AddHostedService<DeviceRegistrationService>(); // <-- registers DeviceId + DeviceName on first run
-
-        var isTest = builder.Configuration.GetValue<bool>("App:TestMode");
-        if (!isTest)
-        {
-            builder.Services.AddHostedService(sp => sp.GetRequiredService<RfidService>());
-        }
-
+        builder.Services.AddHostedService<DeviceRegistrationService>();
+        var tmp = configuration.GetSection("App").Get<AppOptions>() ?? new AppOptions();
+        if (!tmp.TestMode) builder.Services.AddHostedService(sp => sp.GetRequiredService<RfidService>());
         builder.Services.AddHostedService(sp => sp.GetRequiredService<RfidResolverService>());
 
-        // Logging
+        // logging
         builder.Logging.ClearProviders();
         builder.Logging.AddSimpleConsole(o => { o.SingleLine = true; o.TimestampFormat = "HH:mm:ss "; });
         builder.Logging.SetMinimumLevel(LogLevel.Information);
 
-        // Configure HTTP port
-        var httpPort = builder.Configuration.GetValue<int>("App:HttpPort", 5000);
+        // HTTP
+        var httpPort = configuration.GetValue<int>("App:HttpPort", 5002);
         builder.WebHost.UseUrls($"http://localhost:{httpPort}");
-
         builder.Services.AddCors();
 
         var app = builder.Build();
 
-        app.UseCors(policy =>
-            policy
-        .AllowAnyOrigin()
-        .AllowAnyHeader()
-        .AllowAnyMethod());
+        app.Use(async (ctx, next) =>
+        {
+            var origin = ctx.Request.Headers["Origin"];
+            ctx.Response.Headers.Add("Access-Control-Allow-Origin", string.IsNullOrEmpty(origin) ? "*" : origin);
+            ctx.Response.Headers.Add("Vary", "Origin");
+            ctx.Response.Headers.Add("Access-Control-Allow-Methods", "GET, OPTIONS");
+            ctx.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
 
-        // HTTP Endpoint: GET /device-id
+            // Handle preflight (OPTIONS) requests directly
+            if (ctx.Request.Method.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase))
+            {
+                ctx.Response.StatusCode = StatusCodes.Status204NoContent;
+                return;
+            }
+
+            await next();
+        });
+
         app.MapGet("/device-id", () =>
         {
             var deviceId = DeviceIdentity.GetOrCreateDeviceId();
-            var filePath = DeviceIdentity.GetDeviceIdPath();
-
-            return Results.Json(new
-            {
-                deviceId,
-                filePath,
-                timestamp = DateTime.UtcNow
-            });
+            return Results.Json(new { deviceId, filePath = DeviceIdentity.GetDeviceIdPath(), timestamp = DateTime.UtcNow });
         });
 
-        // HTTP Endpoint: GET /device-info  (includes name)
         app.MapGet("/device-info", (IOptions<DeviceOptions> devOpt) =>
         {
             var deviceId = DeviceIdentity.GetOrCreateDeviceId();
@@ -619,19 +656,14 @@ public class Program
             });
         });
 
-        // Root endpoint
         app.MapGet("/", () => Results.Json(new
         {
             message = "RFID Service API",
-            endpoints = new[]
-            {
-                "/device-id   - Get device identifier",
-                "/device-info - Get device id & name"
-            }
+            endpoints = new[] { "/device-id", "/device-info" }
         }));
 
-        Console.WriteLine("RFID → SQL (CarteSLV) → Azure SignalR (slv_hub)");
-        Console.WriteLine($"HTTP API listening on http://localhost:{httpPort}");
+        Console.WriteLine("RFID → SQL (CarteSLV) → Azure SignalR");
+        Console.WriteLine($"HTTP API: http://localhost:{httpPort}");
         Console.WriteLine($"Device ID file:   {DeviceIdentity.GetDeviceIdPath()}");
         Console.WriteLine($"Device Name file: {DeviceIdentity.GetDeviceNamePath()}");
         Console.WriteLine("Ctrl+C to exit.");
