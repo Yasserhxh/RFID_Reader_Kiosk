@@ -33,8 +33,8 @@ public sealed class AppOptions
 
 public sealed class RfidOptions
 {
-    public string Host { get; set; } = "10.116.136.22";
-    public string? FallbackHost { get; set; } = "10.8.197.20";
+    public string Host { get; set; } = "10.116.136.27";
+    public string? FallbackHost { get; set; } = "10.8.197.24";
     public int Port { get; set; } = 4001;
     public int ReconnectDelayMs { get; set; } = 2000;
     public int ReadBufferBytes { get; set; } = 4096;
@@ -51,8 +51,8 @@ public sealed class DbOptions
 public sealed class SignalROptions
 {
     public string ConnectionString { get; set; } = default!;
-    public string HubName { get; set; } = "slv_pabentry_hub";
-    public string MethodName { get; set; } = "ReceivePabEntryRfid";
+    public string HubName { get; set; } = "slv_pabexit_hub";
+    public string MethodName { get; set; } = "ReceivePabExitRfid";
 }
 
 public sealed class DeviceOptions
