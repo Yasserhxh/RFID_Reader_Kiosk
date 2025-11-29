@@ -33,8 +33,8 @@ public sealed class AppOptions
 
 public sealed class RfidOptions
 {
-    public string Host { get; set; } = "10.116.136.39";
-    public string? FallbackHost { get; set; } = "10.8.197.35";
+    public string Host { get; set; } = "10.116.136.14";
+    public string? FallbackHost { get; set; } = "10.8.197.14";
     public int Port { get; set; } = 4001;
     public int ReconnectDelayMs { get; set; } = 2000;
     public int ReadBufferBytes { get; set; } = 4096;
