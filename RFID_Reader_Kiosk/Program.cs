@@ -45,7 +45,7 @@ public sealed class RfidOptions
 public sealed class DbOptions
 {
     public string ConnectionString { get; set; } = default!;
-    public string ClientEquipementsTable { get; set; } = "dbo.Ecare_ClientEquipements";
+    public string TagsTable { get; set; } = "dbo.Ecare_Tags";
 }
 
 public sealed class SignalROptions
@@ -367,7 +367,7 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
             WHERE RfidHex = @hex
         """;
 
-        var sql = sqlTemplate.Replace("{TABLE}", _opt.ClientEquipementsTable);
+        var sql = sqlTemplate.Replace("{TABLE}", _opt.TagsTable);
         await using var conn = new SqlConnection(_opt.ConnectionString);
         await conn.OpenAsync(ct);
 
@@ -704,9 +704,9 @@ public class Program
                 builder.Configuration.GetConnectionString("SqlServer")
                 ?? throw new InvalidOperationException("ConnectionStrings:SqlServer missing");
 
-            var table = builder.Configuration["Db:ClientEquipementsTable"];
+            var table = builder.Configuration["Db:TagsTable"];
             if (!string.IsNullOrWhiteSpace(table))
-                opt.ClientEquipementsTable = table!;
+                opt.TagsTable = table!;
         });
         builder.Services.Configure<SignalROptions>(builder.Configuration.GetSection("SignalR"));
 
