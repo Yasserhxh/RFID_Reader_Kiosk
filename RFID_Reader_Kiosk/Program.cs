@@ -27,7 +27,7 @@ using System.Text.RegularExpressions;
 public sealed class AppOptions
 {
     public bool TestMode { get; set; } = false;
-    public int TestIntervalMs { get; set; } = 60000;
+    public int TestIntervalMs { get; set; } = 5000;
     public int HttpPort { get; set; } = 5003;
 }
 
@@ -45,7 +45,7 @@ public sealed class RfidOptions
 public sealed class DbOptions
 {
     public string ConnectionString { get; set; } = default!;
-    public string ClientEquipementsTable { get; set; } = "dbo.Ecare_ClientEquipements";
+    public string TagsTable { get; set; } = "dbo.Ecare_Tags";
 }
 
 public sealed class SignalROptions
@@ -367,7 +367,7 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
             WHERE RfidHex = @hex
         """;
 
-        var sql = sqlTemplate.Replace("{TABLE}", _opt.ClientEquipementsTable);
+        var sql = sqlTemplate.Replace("{TABLE}", _opt.TagsTable);
         await using var conn = new SqlConnection(_opt.ConnectionString);
         await conn.OpenAsync(ct);
 
@@ -706,7 +706,7 @@ public class Program
 
             var table = builder.Configuration["Db:ClientEquipementsTable"];
             if (!string.IsNullOrWhiteSpace(table))
-                opt.ClientEquipementsTable = table!;
+                opt.TagsTable = table!;
         });
         builder.Services.Configure<SignalROptions>(builder.Configuration.GetSection("SignalR"));
 
