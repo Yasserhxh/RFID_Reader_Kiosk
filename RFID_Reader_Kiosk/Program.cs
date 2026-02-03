@@ -46,13 +46,20 @@ public sealed class DbOptions
 {
     public string ConnectionString { get; set; } = default!;
     public string TagsTable { get; set; } = "dbo.Ecare_Tags";
+    public string OrderLegendTable { get; set; } = "dbo.Ecare_Order_Legend";
 }
 
 public sealed class SignalROptions
 {
     public string ConnectionString { get; set; } = default!;
+
+    // ENTRY (default / existing behavior)
     public string HubName { get; set; } = "slv_pabentry_hub";
     public string MethodName { get; set; } = "ReceivePabEntryRfid";
+
+    // EXIT (new behavior for Step=4)
+    public string ExitHubName { get; set; } = "slv_pabexit_hub";
+    public string ExitMethodName { get; set; } = "ReceivePabExitRfid";
 }
 
 public sealed class DeviceOptions
@@ -230,8 +237,6 @@ public sealed class RfidService : IHostedService
                 var buffer = ArrayPool<byte>.Shared.Rent(_opt.ReadBufferBytes);
                 var sb = new StringBuilder();
 
-                _log.LogInformation("RFID connected to {host}:{port}", _opt.Host, _opt.Port);
-
                 try
                 {
                     while (!ct.IsCancellationRequested)
@@ -286,6 +291,7 @@ public sealed class RfidService : IHostedService
             }
         }
     }
+
     private static IEnumerable<string> SplitLines(StringBuilder sb, string? customTerminatorRegex)
     {
         if (string.IsNullOrEmpty(customTerminatorRegex))
@@ -346,6 +352,9 @@ public sealed class RfidService : IHostedService
 public interface IClientEquipementRepository
 {
     Task<string?> GetCarteSlvByRfidHexAsync(string hexCanonical, CancellationToken ct);
+
+    // NEW: get Step from Ecare_Order_Legend by RfidCard (e.g. 1142)
+    Task<int?> GetStepByRfidCardAsync(string rfidCard, CancellationToken ct);
 }
 
 public sealed class ClientEquipementRepository : IClientEquipementRepository
@@ -381,6 +390,38 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
 
         return slv;
     }
+
+    public async Task<int?> GetStepByRfidCardAsync(string rfidCard, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(rfidCard))
+            return null;
+
+        const string sqlTemplate = """
+            SELECT TOP(1) Step
+            FROM {TABLE}
+            WHERE RfidCard = @rfidCard
+        """;
+
+        var sql = sqlTemplate.Replace("{TABLE}", _opt.OrderLegendTable);
+
+        await using var conn = new SqlConnection(_opt.ConnectionString);
+        await conn.OpenAsync(ct);
+
+        // If it's numeric, pass it as int to avoid implicit conversions; otherwise pass as string.
+        object paramValue = rfidCard;
+        if (int.TryParse(rfidCard.Trim(), out var asInt))
+            paramValue = asInt;
+
+        var step = await conn.QueryFirstOrDefaultAsync<int?>(
+            new CommandDefinition(sql, new { rfidCard = paramValue }, cancellationToken: ct));
+
+        if (step is null)
+            _log.LogWarning("No Step found for RfidCard={rfidCard}", rfidCard);
+        else
+            _log.LogInformation("Legend: RfidCard={rfidCard} -> Step={step}", rfidCard, step);
+
+        return step;
+    }
 }
 
 #endregion
@@ -392,8 +433,12 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
     private readonly ILogger<SignalRPublisher> _log;
     private readonly SignalROptions _opt;
     private readonly DeviceOptions _dev;
+
     private ServiceManager? _mgr;
-    private ServiceHubContext? _hub;
+
+    private ServiceHubContext? _entryHub;
+    private ServiceHubContext? _exitHub;
+
     private readonly string _deviceId;
     private readonly string _deviceName;
 
@@ -422,28 +467,53 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
             .WithOptions(o => o.ConnectionString = _opt.ConnectionString)
             .BuildServiceManager();
 
-        _hub = await _mgr.CreateHubContextAsync(_opt.HubName, cancellationToken);
-        _log.LogInformation("SignalR hub context ready for {Hub}", _opt.HubName);
+        // ENTRY hub context
+        _entryHub = await _mgr.CreateHubContextAsync(_opt.HubName, cancellationToken);
+        _log.LogInformation("SignalR ENTRY hub context ready for {Hub}", _opt.HubName);
+
+        // EXIT hub context (if different)
+        if (!string.Equals(_opt.ExitHubName, _opt.HubName, StringComparison.OrdinalIgnoreCase))
+        {
+            _exitHub = await _mgr.CreateHubContextAsync(_opt.ExitHubName, cancellationToken);
+            _log.LogInformation("SignalR EXIT hub context ready for {Hub}", _opt.ExitHubName);
+        }
+        else
+        {
+            _exitHub = _entryHub;
+            _log.LogInformation("SignalR EXIT hub name equals ENTRY hub name; reusing same hub context.");
+        }
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
-        => Task.CompletedTask;
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     public async ValueTask DisposeAsync()
     {
-        if (_hub is not null)
-            await _hub.DisposeAsync();
+        if (_entryHub is not null)
+            await _entryHub.DisposeAsync();
+
+        if (_exitHub is not null && !ReferenceEquals(_exitHub, _entryHub))
+            await _exitHub.DisposeAsync();
 
         _mgr?.Dispose();
     }
 
-    public async Task PublishRfidAsync(string? carteSlv)
+    public async Task PublishRfidAsync(string? carteSlv, int? step)
     {
-        if (_hub is null) return;
+        // Route based on Step:
+        // Step==1 -> ENTRY (keep default)
+        // Step==4 -> EXIT (use slv_pabexit_hub / ReceivePabExitRfid)
+        var useExit = step == 4;
+
+        var hub = useExit ? _exitHub : _entryHub;
+        if (hub is null) return;
+
+        var hubName = useExit ? _opt.ExitHubName : _opt.HubName;
+        var method = useExit ? _opt.ExitMethodName : _opt.MethodName;
 
         var payload = new
         {
             carteSlv,
+            step,
             deviceId = _deviceId,
             deviceName = _deviceName,
             tsUtc = DateTime.UtcNow
@@ -451,12 +521,13 @@ public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
 
         try
         {
-            await _hub.Clients.All.SendAsync(_opt.MethodName, payload);
-            _log.LogInformation("📡 Sent via SignalR: {payload}", JsonSerializer.Serialize(payload));
+            await hub.Clients.All.SendAsync(method, payload);
+            _log.LogInformation("📡 Sent via SignalR ({hubName}/{method}): {payload}",
+                hubName, method, JsonSerializer.Serialize(payload));
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "SignalR send failed");
+            _log.LogWarning(ex, "SignalR send failed ({hubName}/{method})", hubName, method);
         }
     }
 }
@@ -528,8 +599,7 @@ public sealed class DeviceRegistrationService : IHostedService
         }
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
-        => Task.CompletedTask;
+    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 }
 
 #endregion
@@ -575,6 +645,7 @@ public sealed class RfidResolverService : IHostedService
 
         return Task.CompletedTask;
     }
+
     public Task StopAsync(CancellationToken cancellationToken)
     {
         if (_app.TestMode)
@@ -612,9 +683,14 @@ public sealed class RfidResolverService : IHostedService
             }
 
             var slv = line.Trim();
-            _log.LogInformation("Sending manual SLV='{slv}'", slv);
 
-            await _signalR.PublishRfidAsync(slv);
+            int? step = null;
+            try { step = await _repo.GetStepByRfidCardAsync(slv, ct); }
+            catch (Exception ex) { _log.LogWarning(ex, "Step lookup failed for SLV={slv}", slv); }
+
+            _log.LogInformation("Sending manual SLV='{slv}' (Step={step})", slv, step);
+
+            await _signalR.PublishRfidAsync(slv, step);
         }
     }
 
@@ -622,14 +698,21 @@ public sealed class RfidResolverService : IHostedService
     {
         try
         {
+            // RFID hex -> CarteSLV
             var slv = await _repo.GetCarteSlvByRfidHexAsync(e.HexCanonical, CancellationToken.None);
+
+            // CarteSLV -> Step (Ecare_Order_Legend WHERE RfidCard = <CarteSLV>)
+            int? step = null;
+            if (!string.IsNullOrWhiteSpace(slv))
+                step = await _repo.GetStepByRfidCardAsync(slv!, CancellationToken.None);
 
             if (slv is null)
                 Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> NOT FOUND");
             else
-                Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> CarteSLV={slv}");
+                Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> CarteSLV={slv} (Step={step?.ToString() ?? "null"})");
 
-            await _signalR.PublishRfidAsync(slv);
+            // Publish routed by step: 1=ENTRY, 4=EXIT
+            await _signalR.PublishRfidAsync(slv, step);
         }
         catch (Exception ex)
         {
@@ -707,6 +790,10 @@ public class Program
             var table = builder.Configuration["Db:TagsTable"];
             if (!string.IsNullOrWhiteSpace(table))
                 opt.TagsTable = table!;
+
+            var legend = builder.Configuration["Db:OrderLegendTable"];
+            if (!string.IsNullOrWhiteSpace(legend))
+                opt.OrderLegendTable = legend!;
         });
         builder.Services.Configure<SignalROptions>(builder.Configuration.GetSection("SignalR"));
 
@@ -793,10 +880,10 @@ public class Program
             });
         });
 
-        // POST: /send-slv (YOUR NEW ENDPOINT)
+        // POST: /send-slv (publishes SLV; now also routes by Step from Ecare_Order_Legend)
         app.MapPost("/send-slv", async (
             SlvRequest req,
-            IOptions<AppOptions> appOpt,
+            IClientEquipementRepository repo,
             SignalRPublisher publisher) =>
         {
             if (req is null || string.IsNullOrWhiteSpace(req.Slv))
@@ -804,28 +891,18 @@ public class Program
 
             var slv = req.Slv.Trim();
 
-            // TEST MODE → use posted SLV instead of manual input
-            if (appOpt.Value.TestMode)
-            {
-                await publisher.PublishRfidAsync(slv);
+            int? step = null;
+            try { step = await repo.GetStepByRfidCardAsync(slv, CancellationToken.None); }
+            catch { /* keep step null */ }
 
-                return Results.Json(new
-                {
-                    mode = "TEST",
-                    sent = true,
-                    slv,
-                    timestamp = DateTime.UtcNow
-                });
-            }
-
-            // REAL MODE → publish directly, no RFID lookup
-            await publisher.PublishRfidAsync(slv);
+            await publisher.PublishRfidAsync(slv, step);
 
             return Results.Json(new
             {
-                mode = "REAL",
                 sent = true,
                 slv,
+                step,
+                routedTo = (step == 4) ? "EXIT" : "ENTRY",
                 timestamp = DateTime.UtcNow
             });
         });
@@ -845,7 +922,7 @@ public class Program
             });
         });
 
-        Console.WriteLine("RFID → SQL (CarteSLV) → Azure SignalR");
+        Console.WriteLine("RFID → SQL (CarteSLV) → Step → Azure SignalR (ENTRY/EXIT)");
         Console.WriteLine($"HTTP API: http://localhost:{httpPort}");
         Console.WriteLine($"Device ID file:   {DeviceIdentity.GetDeviceIdPath()}");
         Console.WriteLine($"Device Name file: {DeviceIdentity.GetDeviceNamePath()}");
@@ -868,7 +945,6 @@ public class Program
         Console.WriteLine($"HTTP API     : http://{localIp}:{httpPort}");
         Console.WriteLine($"POST SLV     : http://{localIp}:{httpPort}/send-slv");
         Console.WriteLine("==========================================");
-
 
         await app.RunAsync();
     }
