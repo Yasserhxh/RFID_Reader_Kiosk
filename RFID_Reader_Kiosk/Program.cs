@@ -1,8 +1,15 @@
-﻿// .NET 8 Console/Minimal API — RFID -> SQL Server (Dapper) -> Azure SignalR
-// Single EXE, embedded PDB, embedded appsettings.json
-// DeviceId is ALWAYS generated on first run (GUID) then persisted; no ForceDeviceId support.
+﻿// Program.cs — .NET 8 (Merged)
+// RFID (TCP) -> SQL (Card + Step) -> caches current Step -> Scale (TCP) -> Azure SignalR (route by Step)
+// + HTTP API: /device-id, /status, /send-slv
+//
+// Packages:
+//   dotnet add package Microsoft.Azure.SignalR.Management
+//   dotnet add package Microsoft.Data.SqlClient
+//   dotnet add package Dapper
+//
+// Run:
+//   dotnet run
 
-using Azure;
 using Dapper;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -16,86 +23,30 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Buffers;
+using System.Globalization;
+using System.IO;
+using System.Linq;
 using System.Net.Sockets;
-using System.Reflection;
 using System.Text;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 
-#region Options
+#region Device ID Manager
 
-public sealed class AppOptions
-{
-    public bool TestMode { get; set; } = false;
-    public int TestIntervalMs { get; set; } = 60000;
-    public int HttpPort { get; set; } = 5003;
-}
-
-public sealed class RfidOptions
-{
-    public string Host { get; set; } = "10.116.136.22";
-    public string? FallbackHost { get; set; } = "10.8.197.20";
-    public int Port { get; set; } = 4001;
-    public int ReconnectDelayMs { get; set; } = 2000;
-    public int ReadBufferBytes { get; set; } = 4096;
-    public int DebounceSeconds { get; set; } = 5;
-    public string? LineTerminatorRegex { get; set; }
-}
-
-public sealed class DbOptions
-{
-    public string ConnectionString { get; set; } = default!;
-    public string TagsTable { get; set; } = "dbo.Ecare_Tags";
-    public string OrderLegendTable { get; set; } = "dbo.Ecare_Order_Legend";
-}
-
-public sealed class SignalROptions
-{
-    public string ConnectionString { get; set; } = default!;
-
-    // ENTRY (default / existing behavior)
-    public string HubName { get; set; } = "slv_pabentry_hub";
-    public string MethodName { get; set; } = "ReceivePabEntryRfid";
-
-    // EXIT (new behavior for Step=4)
-    public string ExitHubName { get; set; } = "slv_pabexit_hub";
-    public string ExitMethodName { get; set; } = "ReceivePabExitRfid";
-}
-
-public sealed class DeviceOptions
-{
-    public string? Name { get; set; }
-    public string? Site { get; set; }
-}
-
-#endregion
-
-#region DTO for POST
-public sealed class SlvRequest
-{
-    public string? Slv { get; set; }
-}
-#endregion
-
-#region Device Identity
-
-public static class DeviceIdentity
+public static class DeviceIdManager
 {
     private static readonly string DeviceIdFile;
-    private static readonly string DeviceNameFile;
     private static string? _cachedDeviceId;
-    private static string? _cachedDeviceName;
 
-    static DeviceIdentity()
+    static DeviceIdManager()
     {
         var baseDirectory = AppContext.BaseDirectory;
         DeviceIdFile = Path.Combine(baseDirectory, "device.id.txt");
-        DeviceNameFile = Path.Combine(baseDirectory, "device.name.txt");
     }
 
     public static string GetOrCreateDeviceId()
     {
-        if (_cachedDeviceId is not null) return _cachedDeviceId;
+        if (_cachedDeviceId != null)
+            return _cachedDeviceId;
 
         if (File.Exists(DeviceIdFile))
         {
@@ -113,37 +64,140 @@ public static class DeviceIdentity
         return newId;
     }
 
-    public static string GetOrCreateDeviceName(string? configuredName = null)
-    {
-        if (_cachedDeviceName is not null) return _cachedDeviceName;
-
-        if (File.Exists(DeviceNameFile))
-        {
-            var existing = File.ReadAllText(DeviceNameFile).Trim();
-            if (!string.IsNullOrWhiteSpace(existing))
-            {
-                _cachedDeviceName = existing;
-                return existing;
-            }
-        }
-
-        var deviceId = GetOrCreateDeviceId();
-        var last4 = deviceId.Length >= 4 ? deviceId[^4..] : deviceId;
-        var defaultName = $"kiosk--{last4}".ToLowerInvariant();
-
-        var name = string.IsNullOrWhiteSpace(configuredName) ? defaultName : configuredName.Trim();
-        File.WriteAllText(DeviceNameFile, name);
-        _cachedDeviceName = name;
-        return name;
-    }
-
-    public static string GetDeviceIdPath() => DeviceIdFile;
-    public static string GetDeviceNamePath() => DeviceNameFile;
+    public static string GetDeviceIdFilePath() => DeviceIdFile;
 }
 
 #endregion
 
-#region Tag Event Args
+#region Options
+
+public sealed class AppOptions
+{
+    public bool TestMode { get; set; } = false;
+    public int HttpPort { get; set; } = 5001;
+    public string? ForceDeviceId { get; set; }
+}
+
+public sealed class RfidOptions
+{
+    public string Host { get; set; } = "10.116.136.22";
+    public string? FallbackHost { get; set; } = null;
+    public int Port { get; set; } = 4001;
+    public int ReconnectDelayMs { get; set; } = 2000;
+    public int ReadBufferBytes { get; set; } = 4096;
+    public int DebounceSeconds { get; set; } = 5;
+    public string? LineTerminatorRegex { get; set; }
+}
+
+public sealed class ScaleOptions
+{
+    public string Host { get; set; } = "10.8.197.26";
+    public int Port { get; set; } = 4001;
+    public int ReadTimeoutMs { get; set; } = 3000;
+    public int ReconnectDelayMs { get; set; } = 1500;
+
+    public decimal Divisor { get; set; } = 1m;
+    public int MinDigits { get; set; } = 3;
+
+    public bool TestMode { get; set; } = false;
+    public int TestTickMs { get; set; } = 150;
+    public int TestMaxKg { get; set; } = 16000;
+}
+
+public sealed class DbOptions
+{
+    public string ConnectionString { get; set; } = default!;
+
+    // RFID hex -> card (CarteSLV)
+    public string ClientEquipementsTable { get; set; } = "dbo.Ecare_ClientEquipements";
+
+    // card -> step
+    public string OrderLegendTable { get; set; } = "dbo.Ecare_OrderLegend";
+}
+
+public sealed class SignalROptions
+{
+    public string ConnectionString { get; set; } = default!;
+
+    // step -> hub/method routing for weight
+    public Dictionary<int, SignalRTarget> Targets { get; set; } = new();
+
+    // optional: publish RFID card events somewhere
+    public string? RfidHubName { get; set; }
+    public string? RfidMethodName { get; set; }
+}
+
+public sealed class SignalRTarget
+{
+    public string HubName { get; set; } = default!;
+    public string MethodName { get; set; } = default!;
+}
+
+#endregion
+
+#region Shared State
+
+public interface IStepState
+{
+    void Update(string rfidCard, int? step, DateTime atUtc);
+    (string? card, int? step, DateTime? atUtc) Snapshot();
+}
+
+public sealed class StepState : IStepState
+{
+    private readonly object _lock = new();
+    private string? _card;
+    private int? _step;
+    private DateTime? _atUtc;
+
+    public void Update(string rfidCard, int? step, DateTime atUtc)
+    {
+        lock (_lock)
+        {
+            _card = rfidCard;
+            _step = step;
+            _atUtc = atUtc;
+        }
+    }
+
+    public (string? card, int? step, DateTime? atUtc) Snapshot()
+    {
+        lock (_lock) return (_card, _step, _atUtc);
+    }
+}
+
+public interface IWeightState
+{
+    void Update(decimal weightKg, bool isStable, DateTime atUtc);
+    (decimal? weightKg, bool? isStable, DateTime? atUtc) Snapshot();
+}
+
+public sealed class WeightState : IWeightState
+{
+    private readonly object _lock = new();
+    private decimal? _w;
+    private bool? _stable;
+    private DateTime? _atUtc;
+
+    public void Update(decimal weightKg, bool isStable, DateTime atUtc)
+    {
+        lock (_lock)
+        {
+            _w = weightKg;
+            _stable = isStable;
+            _atUtc = atUtc;
+        }
+    }
+
+    public (decimal? weightKg, bool? isStable, DateTime? atUtc) Snapshot()
+    {
+        lock (_lock) return (_w, _stable, _atUtc);
+    }
+}
+
+#endregion
+
+#region RFID Service
 
 public sealed class TagEventArgs : EventArgs
 {
@@ -151,10 +205,6 @@ public sealed class TagEventArgs : EventArgs
     public required string HexCanonical { get; init; }
     public required DateTime Timestamp { get; init; }
 }
-
-#endregion
-
-#region RFID Service
 
 public sealed class RfidService : IHostedService
 {
@@ -165,10 +215,7 @@ public sealed class RfidService : IHostedService
     public event EventHandler<TagEventArgs>? TagReceived;
 
     public RfidService(ILogger<RfidService> log, IOptions<RfidOptions> opt)
-    {
-        _log = log;
-        _opt = opt.Value;
-    }
+    { _log = log; _opt = opt.Value; }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
@@ -178,10 +225,7 @@ public sealed class RfidService : IHostedService
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
-    {
-        try { _cts?.Cancel(); } catch { }
-        return Task.CompletedTask;
-    }
+    { try { _cts?.Cancel(); } catch { } return Task.CompletedTask; }
 
     private async Task RunAsync(CancellationToken ct)
     {
@@ -192,98 +236,88 @@ public sealed class RfidService : IHostedService
         {
             try
             {
-                string[] hosts = new[]
-                {
-                    _opt.Host,
-                    _opt.FallbackHost ?? ""
-                };
+                var hostToTry = new[] { _opt.Host, _opt.FallbackHost }
+                    .Where(h => !string.IsNullOrWhiteSpace(h))
+                    .ToArray();
+
+                Exception? lastEx = null;
 
                 TcpClient? tcp = null;
-
-                foreach (var host in hosts)
+                foreach (var host in hostToTry)
                 {
-                    if (string.IsNullOrWhiteSpace(host)) continue;
-
                     try
                     {
                         tcp = new TcpClient();
-
-                        var connectTask = tcp.ConnectAsync(host, _opt.Port);
+                        var connectTask = tcp.ConnectAsync(host!, _opt.Port);
                         var winner = await Task.WhenAny(connectTask, Task.Delay(_opt.ReconnectDelayMs, ct));
+                        if (winner != connectTask) throw new TimeoutException($"RFID connect timeout ({host}:{_opt.Port})");
+                        await connectTask;
 
-                        if (winner == connectTask)
-                        {
-                            await connectTask;
-                            _log.LogInformation("RFID connected to {host}:{port}", host, _opt.Port);
-                            break;
-                        }
-
-                        _log.LogWarning("Timeout connecting to {host}:{port}", host, _opt.Port);
+                        _log.LogInformation("RFID connected to {host}:{port}", host, _opt.Port);
+                        break;
                     }
                     catch (Exception ex)
                     {
-                        _log.LogWarning(ex, "Failed to connect to {host}:{port}", host, _opt.Port);
+                        lastEx = ex;
+                        try { tcp?.Dispose(); } catch { }
+                        tcp = null;
                     }
                 }
 
-                if (tcp == null || !tcp.Connected)
-                {
-                    _log.LogError("Both primary and fallback RFID endpoints failed. Retrying in {ms}ms...", _opt.ReconnectDelayMs);
-                    await Task.Delay(_opt.ReconnectDelayMs, ct);
-                    continue;
-                }
+                if (tcp is null)
+                    throw lastEx ?? new Exception("RFID connect failed to all hosts.");
 
-                using var stream = tcp.GetStream();
-                var buffer = ArrayPool<byte>.Shared.Rent(_opt.ReadBufferBytes);
-                var sb = new StringBuilder();
-
-                try
+                using (tcp)
                 {
-                    while (!ct.IsCancellationRequested)
+                    using var stream = tcp.GetStream();
+
+                    var buffer = ArrayPool<byte>.Shared.Rent(_opt.ReadBufferBytes);
+                    var sb = new StringBuilder();
+
+                    _log.LogInformation("RFID stream opened.");
+
+                    try
                     {
-                        if (!stream.DataAvailable)
+                        while (!ct.IsCancellationRequested)
                         {
-                            await Task.Delay(5, ct);
-                            continue;
-                        }
+                            if (!stream.DataAvailable) { await Task.Delay(5, ct); continue; }
 
-                        int n = await stream.ReadAsync(buffer.AsMemory(0, _opt.ReadBufferBytes), ct);
-                        if (n <= 0) throw new IOException("RFID remote closed");
+                            int n = await stream.ReadAsync(buffer.AsMemory(0, _opt.ReadBufferBytes), ct);
+                            if (n <= 0) throw new IOException("RFID remote closed");
 
-                        var chunk = Encoding.ASCII.GetString(buffer, 0, n);
-                        sb.Append(chunk);
+                            var chunk = Encoding.ASCII.GetString(buffer, 0, n);
+                            sb.Append(chunk);
 
-                        foreach (var line in SplitLines(sb, _opt.LineTerminatorRegex))
-                        {
-                            var clean = StripControlChars(line).Trim();
-                            if (string.IsNullOrEmpty(clean)) continue;
-
-                            var hexCanonical = ToCanonicalHex(clean);
-                            var now = DateTime.Now;
-
-                            if (hexCanonical.Length == 0) continue;
-                            if (lastSeen.TryGetValue(hexCanonical, out var t) && now - t < debWindow) continue;
-                            lastSeen[hexCanonical] = now;
-
-                            _log.LogInformation("[RFID] Raw='{raw}'  HEX={hex}", clean, hexCanonical);
-                            TagReceived?.Invoke(this, new TagEventArgs
+                            foreach (var line in SplitLines(sb, _opt.LineTerminatorRegex))
                             {
-                                RawAscii = clean,
-                                HexCanonical = hexCanonical,
-                                Timestamp = now
-                            });
+                                var clean = StripControlChars(line).Trim();
+                                if (string.IsNullOrEmpty(clean)) continue;
+
+                                var hexCanonical = ToCanonicalHex(clean);
+                                var now = DateTime.Now;
+
+                                if (hexCanonical.Length == 0) continue;
+                                if (lastSeen.TryGetValue(hexCanonical, out var t) && now - t < debWindow) continue;
+                                lastSeen[hexCanonical] = now;
+
+                                _log.LogInformation("[RFID] Raw='{raw}' HEX={hex}", clean, hexCanonical);
+                                TagReceived?.Invoke(this, new TagEventArgs
+                                {
+                                    RawAscii = clean,
+                                    HexCanonical = hexCanonical,
+                                    Timestamp = now
+                                });
+                            }
                         }
                     }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
                 }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(buffer);
-                }
+
             }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
+            catch (OperationCanceledException) { break; }
             catch (Exception ex)
             {
                 _log.LogWarning(ex, "RFID loop error; retrying in {ms}ms", _opt.ReconnectDelayMs);
@@ -298,9 +332,7 @@ public sealed class RfidService : IHostedService
         {
             var text = sb.ToString();
             var lines = text.Split(new[] { "\r\n", "\n", "\r" }, StringSplitOptions.None);
-            for (int i = 0; i < lines.Length - 1; i++)
-                yield return lines[i];
-
+            for (int i = 0; i < lines.Length - 1; i++) yield return lines[i];
             sb.Clear().Append(lines[^1]);
         }
         else
@@ -308,13 +340,11 @@ public sealed class RfidService : IHostedService
             var rx = new Regex(customTerminatorRegex, RegexOptions.Compiled);
             string text = sb.ToString();
             int last = 0;
-
             foreach (Match m in rx.Matches(text))
             {
                 yield return text[last..m.Index];
                 last = m.Index + m.Length;
             }
-
             sb.Clear().Append(text[last..]);
         }
     }
@@ -322,10 +352,7 @@ public sealed class RfidService : IHostedService
     private static string StripControlChars(string s)
     {
         var b = new StringBuilder(s.Length);
-        foreach (var ch in s)
-            if (!char.IsControl(ch))
-                b.Append(ch);
-
+        foreach (var ch in s) if (!char.IsControl(ch)) b.Append(ch);
         return b.ToString();
     }
 
@@ -337,38 +364,31 @@ public sealed class RfidService : IHostedService
 
         var bytes = Encoding.ASCII.GetBytes(ascii);
         var sb = new StringBuilder(bytes.Length * 2);
-
-        foreach (var b in bytes)
-            sb.Append(b.ToString("X2"));
-
+        foreach (var b in bytes) sb.Append(b.ToString("X2"));
         return sb.ToString();
     }
 }
 
 #endregion
 
-#region Repository
+#region Repository (RFID->Card + Card->Step)
 
-public interface IClientEquipementRepository
+public interface IRepository
 {
-    Task<string?> GetCarteSlvByRfidHexAsync(string hexCanonical, CancellationToken ct);
-
-    // NEW: get Step from Ecare_Order_Legend by RfidCard (e.g. 1142)
+    Task<string?> GetRfidCardByRfidHexAsync(string hexCanonical, CancellationToken ct);
     Task<int?> GetStepByRfidCardAsync(string rfidCard, CancellationToken ct);
 }
 
-public sealed class ClientEquipementRepository : IClientEquipementRepository
+public sealed class Repository : IRepository
 {
-    private readonly ILogger<ClientEquipementRepository> _log;
+    private readonly ILogger<Repository> _log;
     private readonly DbOptions _opt;
 
-    public ClientEquipementRepository(ILogger<ClientEquipementRepository> log, IOptions<DbOptions> opt)
-    {
-        _log = log;
-        _opt = opt.Value;
-    }
+    public Repository(ILogger<Repository> log, IOptions<DbOptions> opt)
+    { _log = log; _opt = opt.Value; }
 
-    public async Task<string?> GetCarteSlvByRfidHexAsync(string hexCanonical, CancellationToken ct)
+    // HEX -> CarteSLV (card)
+    public async Task<string?> GetRfidCardByRfidHexAsync(string hexCanonical, CancellationToken ct)
     {
         const string sqlTemplate = """
             SELECT TOP(1) CarteSLV
@@ -376,21 +396,21 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
             WHERE RfidHex = @hex
         """;
 
-        var sql = sqlTemplate.Replace("{TABLE}", _opt.TagsTable);
+        var sql = sqlTemplate.Replace("{TABLE}", _opt.ClientEquipementsTable);
+
         await using var conn = new SqlConnection(_opt.ConnectionString);
         await conn.OpenAsync(ct);
 
-        var slv = await conn.QueryFirstOrDefaultAsync<string?>(
+        var card = await conn.QueryFirstOrDefaultAsync<string?>(
             new CommandDefinition(sql, new { hex = hexCanonical }, cancellationToken: ct));
 
-        if (slv is null)
-            _log.LogWarning("No match for RfidHex={hex}", hexCanonical);
-        else
-            _log.LogInformation("Match: RfidHex={hex} -> CarteSLV={slv}", hexCanonical, slv);
+        if (card is null) _log.LogWarning("No match for RfidHex={hex}", hexCanonical);
+        else _log.LogInformation("Match: RfidHex={hex} -> RfidCard={card}", hexCanonical, card);
 
-        return slv;
+        return card;
     }
 
+    // Card -> Step
     public async Task<int?> GetStepByRfidCardAsync(string rfidCard, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(rfidCard))
@@ -407,7 +427,6 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
         await using var conn = new SqlConnection(_opt.ConnectionString);
         await conn.OpenAsync(ct);
 
-        // If it's numeric, pass it as int to avoid implicit conversions; otherwise pass as string.
         object paramValue = rfidCard;
         if (int.TryParse(rfidCard.Trim(), out var asInt))
             paramValue = asInt;
@@ -426,343 +445,413 @@ public sealed class ClientEquipementRepository : IClientEquipementRepository
 
 #endregion
 
-#region SignalR Publisher
+#region Azure SignalR Router Publisher (weights routed by step)
 
-public sealed class SignalRPublisher : IHostedService, IAsyncDisposable
+public sealed class SignalRRouterPublisher : IHostedService, IAsyncDisposable
 {
-    private readonly ILogger<SignalRPublisher> _log;
+    private readonly ILogger<SignalRRouterPublisher> _log;
     private readonly SignalROptions _opt;
-    private readonly DeviceOptions _dev;
-
-    private ServiceManager? _mgr;
-
-    private ServiceHubContext? _entryHub;
-    private ServiceHubContext? _exitHub;
-
+    private readonly IStepState _stepState;
     private readonly string _deviceId;
-    private readonly string _deviceName;
+    private readonly ServiceManager _mgr;
 
-    public SignalRPublisher(
-        ILogger<SignalRPublisher> log,
+    private readonly Dictionary<string, ServiceHubContext> _hubCache = new(StringComparer.OrdinalIgnoreCase);
+
+    public SignalRRouterPublisher(
+        ILogger<SignalRRouterPublisher> log,
         IOptions<SignalROptions> opt,
-        IOptions<DeviceOptions> dev)
+        IOptions<AppOptions> appOpt,
+        IStepState stepState,
+        ServiceManager mgr)
     {
         _log = log;
         _opt = opt.Value;
-        _dev = dev.Value;
+        _stepState = stepState;
+        _mgr = mgr;
 
-        _deviceId = DeviceIdentity.GetOrCreateDeviceId();
-        _deviceName = DeviceIdentity.GetOrCreateDeviceName(_dev.Name);
+        _deviceId = !string.IsNullOrWhiteSpace(appOpt.Value.ForceDeviceId)
+            ? appOpt.Value.ForceDeviceId!
+            : DeviceIdManager.GetOrCreateDeviceId();
 
-        _log.LogInformation("Device ID: {deviceId} | Device Name: {deviceName}",
-            _deviceId, _deviceName);
+        _log.LogInformation("Device ID: {deviceId}", _deviceId);
     }
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(_opt.ConnectionString))
             throw new InvalidOperationException("SignalR:ConnectionString missing");
+        if (_opt.Targets is null || _opt.Targets.Count == 0)
+            throw new InvalidOperationException("SignalR:Targets missing/empty");
 
-        _mgr = new ServiceManagerBuilder()
-            .WithOptions(o => o.ConnectionString = _opt.ConnectionString)
-            .BuildServiceManager();
+        foreach (var t in _opt.Targets.Values)
+            await GetHubAsync(t.HubName, cancellationToken);
 
-        // ENTRY hub context
-        _entryHub = await _mgr.CreateHubContextAsync(_opt.HubName, cancellationToken);
-        _log.LogInformation("SignalR ENTRY hub context ready for {Hub}", _opt.HubName);
+        if (!string.IsNullOrWhiteSpace(_opt.RfidHubName))
+            await GetHubAsync(_opt.RfidHubName!, cancellationToken);
 
-        // EXIT hub context (if different)
-        if (!string.Equals(_opt.ExitHubName, _opt.HubName, StringComparison.OrdinalIgnoreCase))
-        {
-            _exitHub = await _mgr.CreateHubContextAsync(_opt.ExitHubName, cancellationToken);
-            _log.LogInformation("SignalR EXIT hub context ready for {Hub}", _opt.ExitHubName);
-        }
-        else
-        {
-            _exitHub = _entryHub;
-            _log.LogInformation("SignalR EXIT hub name equals ENTRY hub name; reusing same hub context.");
-        }
+        _log.LogInformation("SignalR router ready.");
     }
 
     public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
-    public async ValueTask DisposeAsync()
+    private async Task<ServiceHubContext> GetHubAsync(string hubName, CancellationToken ct)
     {
-        if (_entryHub is not null)
-            await _entryHub.DisposeAsync();
+        if (_hubCache.TryGetValue(hubName, out var cached))
+            return cached;
 
-        if (_exitHub is not null && !ReferenceEquals(_exitHub, _entryHub))
-            await _exitHub.DisposeAsync();
-
-        _mgr?.Dispose();
+        var hub = await _mgr.CreateHubContextAsync(hubName, ct);
+        _hubCache[hubName] = hub;
+        _log.LogInformation("Hub context ready: {hub}", hubName);
+        return hub;
     }
 
-    public async Task PublishRfidAsync(string? carteSlv, int? step)
+    public async Task PublishWeightAsync(decimal weightKg, bool isStable, CancellationToken ct)
     {
-        // Route based on Step:
-        // Step==1 -> ENTRY (keep default)
-        // Step==4 -> EXIT (use slv_pabexit_hub / ReceivePabExitRfid)
-        var useExit = step == 4;
+        var (_, step, _) = _stepState.Snapshot();
 
-        var hub = useExit ? _exitHub : _entryHub;
-        if (hub is null) return;
+        if (step is null)
+        {
+            _log.LogWarning("No step yet -> skipping weight publish.");
+            return;
+        }
 
-        var hubName = useExit ? _opt.ExitHubName : _opt.HubName;
-        var method = useExit ? _opt.ExitMethodName : _opt.MethodName;
+        if (!_opt.Targets.TryGetValue(step.Value, out var target))
+        {
+            _log.LogWarning("No SignalR target configured for step={step} -> skipping.", step);
+            return;
+        }
+
+        var hub = await GetHubAsync(target.HubName, ct);
 
         var payload = new
         {
-            carteSlv,
+            weight = decimal.Round(weightKg, 1, MidpointRounding.AwayFromZero),
+            isStable,
             step,
             deviceId = _deviceId,
-            deviceName = _deviceName,
             tsUtc = DateTime.UtcNow
         };
 
-        try
+        await hub.Clients.User(_deviceId).SendAsync(target.MethodName, payload, ct);
+
+        _log.LogInformation("Weight sent step={step} hub={hub} method={method} payload={payload}",
+            step, target.HubName, target.MethodName, System.Text.Json.JsonSerializer.Serialize(payload));
+    }
+
+    public async Task PublishRfidCardAsync(string? card, int? step, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(_opt.RfidHubName) || string.IsNullOrWhiteSpace(_opt.RfidMethodName))
+            return;
+
+        var hub = await GetHubAsync(_opt.RfidHubName!, ct);
+
+        var payload = new
         {
-            await hub.Clients.All.SendAsync(method, payload);
-            _log.LogInformation("📡 Sent via SignalR ({hubName}/{method}): {payload}",
-                hubName, method, JsonSerializer.Serialize(payload));
-        }
-        catch (Exception ex)
-        {
-            _log.LogWarning(ex, "SignalR send failed ({hubName}/{method})", hubName, method);
-        }
+            rfidCard = card,
+            step,
+            deviceId = _deviceId,
+            tsUtc = DateTime.UtcNow
+        };
+
+        await hub.Clients.All.SendAsync(_opt.RfidMethodName!, payload, ct);
+
+        _log.LogInformation("RFID event sent hub={hub} method={method} payload={payload}",
+            _opt.RfidHubName, _opt.RfidMethodName, System.Text.Json.JsonSerializer.Serialize(payload));
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        foreach (var hub in _hubCache.Values)
+            await hub.DisposeAsync();
+        _hubCache.Clear();
     }
 }
 
 #endregion
 
-#region Device Registration
-
-public sealed class DeviceRegistrationService : IHostedService
-{
-    private readonly ILogger<DeviceRegistrationService> _log;
-    private readonly DbOptions _db;
-    private readonly DeviceOptions _dev;
-
-    public DeviceRegistrationService(
-        ILogger<DeviceRegistrationService> log,
-        IOptions<DbOptions> db,
-        IOptions<DeviceOptions> dev)
-    {
-        _log = log;
-        _db = db.Value;
-        _dev = dev.Value;
-    }
-
-    public async Task StartAsync(CancellationToken cancellationToken)
-    {
-        var deviceId = DeviceIdentity.GetOrCreateDeviceId();
-        var deviceName = DeviceIdentity.GetOrCreateDeviceName(_dev.Name);
-        var host = Environment.MachineName;
-        var appVersion = typeof(Program).Assembly.GetName().Version?.ToString() ?? "1.0.0";
-
-        const string upsertDevice = """
-        MERGE dbo.Ecare_Device AS t
-        USING (SELECT @DeviceId AS DeviceId) AS s
-        ON (t.DeviceId = s.DeviceId)
-        WHEN MATCHED THEN UPDATE SET
-            Alias = @DeviceName,
-            HostName = COALESCE(@HostName, t.HostName),
-            AppVersion = @AppVersion,
-            UpdatedAtUtc = SYSUTCDATETIME()
-        WHEN NOT MATCHED THEN INSERT (DeviceId, Alias, HostName, AppVersion)
-        VALUES (@DeviceId, @DeviceName, @HostName, @AppVersion);
-        """;
-
-        try
-        {
-            await using var conn = new SqlConnection(_db.ConnectionString);
-            await conn.OpenAsync(cancellationToken);
-
-            await conn.ExecuteAsync(new CommandDefinition(
-                upsertDevice,
-                new
-                {
-                    DeviceId = deviceId,
-                    DeviceName = deviceName,
-                    HostName = host,
-                    AppVersion = appVersion
-                },
-                cancellationToken: cancellationToken
-            ));
-
-            _log.LogInformation(
-                "Device registered: {deviceId} as '{deviceName}' (host {host})",
-                deviceId, deviceName, host);
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "Failed to register device info in dbo.Ecare_Device");
-        }
-    }
-
-    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-}
-
-#endregion
-
-#region Resolver Service
+#region RFID Resolver Hosted Service
 
 public sealed class RfidResolverService : IHostedService
 {
     private readonly ILogger<RfidResolverService> _log;
-    private readonly RfidService _rfid;
-    private readonly IClientEquipementRepository _repo;
-    private readonly SignalRPublisher _signalR;
     private readonly AppOptions _app;
-    private CancellationTokenSource? _manualCts;
+    private readonly RfidService _rfid;
+    private readonly IRepository _repo;
+    private readonly IStepState _stepState;
+    private readonly SignalRRouterPublisher _pub;
 
     public RfidResolverService(
         ILogger<RfidResolverService> log,
+        IOptions<AppOptions> app,
         RfidService rfid,
-        IClientEquipementRepository repo,
-        SignalRPublisher signalR,
-        IOptions<AppOptions> app)
+        IRepository repo,
+        IStepState stepState,
+        SignalRRouterPublisher pub)
     {
         _log = log;
+        _app = app.Value;
         _rfid = rfid;
         _repo = repo;
-        _signalR = signalR;
-        _app = app.Value;
+        _stepState = stepState;
+        _pub = pub;
     }
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         if (_app.TestMode)
         {
-            _manualCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _ = Task.Run(() => ManualInputLoopAsync(_manualCts.Token));
-            _log.LogWarning("TEST MODE (manual): type an SLV and press <Enter> to send.");
-        }
-        else
-        {
-            _rfid.TagReceived += OnTag;
-            _log.LogInformation("Ready. Waiting for RFID tags…");
+            _log.LogWarning("App.TestMode=true. RFID resolver not started.");
+            return Task.CompletedTask;
         }
 
+        _rfid.TagReceived += OnTag;
+        _log.LogInformation("RFID Resolver ready.");
         return Task.CompletedTask;
     }
 
     public Task StopAsync(CancellationToken cancellationToken)
     {
-        if (_app.TestMode)
-        {
-            try { _manualCts?.Cancel(); } catch { }
-        }
-        else
-        {
-            _rfid.TagReceived -= OnTag;
-        }
-
+        _rfid.TagReceived -= OnTag;
         return Task.CompletedTask;
-    }
-
-    private async Task ManualInputLoopAsync(CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            Console.Write("\nEnter SLV (empty to exit test): ");
-            string? line;
-
-            try
-            {
-                line = await Task.Run(Console.ReadLine!, ct);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-
-            if (string.IsNullOrWhiteSpace(line))
-            {
-                _log.LogInformation("Leaving TEST MODE (manual).");
-                break;
-            }
-
-            var slv = line.Trim();
-
-            int? step = null;
-            try { step = await _repo.GetStepByRfidCardAsync(slv, ct); }
-            catch (Exception ex) { _log.LogWarning(ex, "Step lookup failed for SLV={slv}", slv); }
-
-            _log.LogInformation("Sending manual SLV='{slv}' (Step={step})", slv, step);
-
-            await _signalR.PublishRfidAsync(slv, step);
-        }
     }
 
     private async void OnTag(object? sender, TagEventArgs e)
     {
         try
         {
-            // RFID hex -> CarteSLV
-            var slv = await _repo.GetCarteSlvByRfidHexAsync(e.HexCanonical, CancellationToken.None);
-
-            // CarteSLV -> Step (Ecare_Order_Legend WHERE RfidCard = <CarteSLV>)
-            int? step = null;
-            if (!string.IsNullOrWhiteSpace(slv))
-                step = await _repo.GetStepByRfidCardAsync(slv!, CancellationToken.None);
-
-            if (slv is null)
+            var card = await _repo.GetRfidCardByRfidHexAsync(e.HexCanonical, CancellationToken.None);
+            if (card is null)
+            {
                 Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> NOT FOUND");
-            else
-                Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> CarteSLV={slv} (Step={step?.ToString() ?? "null"})");
+                await _pub.PublishRfidCardAsync(null, null, CancellationToken.None);
+                return;
+            }
 
-            // Publish routed by step: 1=ENTRY, 4=EXIT
-            await _signalR.PublishRfidAsync(slv, step);
+            var step = await _repo.GetStepByRfidCardAsync(card, CancellationToken.None);
+            _stepState.Update(card, step, DateTime.UtcNow);
+
+            Console.WriteLine($"[{e.Timestamp:HH:mm:ss}] HEX={e.HexCanonical} -> Card={card} Step={step?.ToString() ?? "NULL"}");
+            await _pub.PublishRfidCardAsync(card, step, CancellationToken.None);
         }
         catch (Exception ex)
         {
-            _log.LogError(ex, "Lookup/send failed for HEX={hex}", e.HexCanonical);
+            _log.LogError(ex, "RFID resolve failed for HEX={hex}", e.HexCanonical);
         }
     }
 }
 
 #endregion
 
-#region Config Loader
+#region Weight Parser + Weight Bridge
 
-static class ConfigLoader
+internal static class WeightParser
 {
-    public static IConfiguration BuildWithEmbeddedFallback()
+    private static readonly Regex ValueWithUnit = new(
+        @"(?<!\S)(?<num>[+-]?\d+(?:[.,]\d+)?)[ ]*(?<unit>kg|g|t|lb|oz)\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    private static readonly Regex AnyNumber = new(
+        @"[+-]?\d+(?:[.,]\d+)?",
+        RegexOptions.Compiled);
+
+    public static bool TryParseWeight(string line, int minDigits, out decimal value)
     {
-        var baseDir = AppContext.BaseDirectory;
-        var external = Path.Combine(baseDir, "appsettings.json");
-
-        var cb = new ConfigurationBuilder()
-            .SetBasePath(baseDir)
-            .AddEnvironmentVariables();
-
-        if (File.Exists(external))
+        var unitMatches = ValueWithUnit.Matches(line);
+        if (unitMatches.Count > 0)
         {
-            cb.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
-            cb.AddJsonFile("appsettings.Development.json", optional: true);
-            Console.WriteLine("Config source: external appsettings.json");
-        }
-        else
-        {
-            var asm = Assembly.GetExecutingAssembly();
-            var name = asm.GetManifestResourceNames()
-                          .FirstOrDefault(n => n.EndsWith("appsettings.json", StringComparison.OrdinalIgnoreCase));
-
-            if (name is not null)
-            {
-                using var stream = asm.GetManifestResourceStream(name)!;
-                cb.AddJsonStream(stream);
-                Console.WriteLine("Config source: embedded appsettings.json");
-            }
-            else
-            {
-                Console.WriteLine("Config source: environment only (no appsettings.json found).");
-            }
+            var m = unitMatches[^1];
+            var raw = m.Groups["num"].Value;
+            if (TryParseDecimalFlexible(raw, out value))
+                return true;
         }
 
-        return cb.Build();
+        Match? best = null;
+        foreach (Match m in AnyNumber.Matches(line))
+        {
+            int digits = CountDigits(m.Value);
+            if (digits >= minDigits && (best is null || m.Value.Length > best.Value.Length))
+                best = m;
+        }
+
+        if (best is not null && TryParseDecimalFlexible(best.Value, out value))
+            return true;
+
+        value = default;
+        return false;
+    }
+
+    private static int CountDigits(string s)
+    {
+        int c = 0;
+        foreach (var ch in s)
+            if (char.IsDigit(ch)) c++;
+        return c;
+    }
+
+    private static bool TryParseDecimalFlexible(string s, out decimal v)
+    {
+        if (decimal.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) return true;
+        if (decimal.TryParse(s, NumberStyles.Float, CultureInfo.GetCultureInfo("fr-FR"), out v)) return true;
+        return false;
     }
 }
+
+public sealed class WeightBridgeService : BackgroundService
+{
+    private readonly ILogger<WeightBridgeService> _log;
+    private readonly ScaleOptions _opt;
+    private readonly SignalRRouterPublisher _pub;
+    private readonly IWeightState _weightState;
+
+    public WeightBridgeService(
+        ILogger<WeightBridgeService> log,
+        IOptions<ScaleOptions> opt,
+        SignalRRouterPublisher pub,
+        IWeightState weightState)
+    {
+        _log = log;
+        _opt = opt.Value;
+        _pub = pub;
+        _weightState = weightState;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (_opt.TestMode)
+        {
+            var rnd = new Random();
+            _log.LogWarning("Scale TEST MODE enabled.");
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var w = rnd.Next(0, _opt.TestMaxKg);
+                var isStable = rnd.Next(0, 10) == 0; // sometimes stable
+                await PublishAsync(w, isStable, stoppingToken);
+                await Task.Delay(_opt.TestTickMs, stoppingToken);
+            }
+            return;
+        }
+
+        // REAL LIVE MODE — BYTE READER (scope-safe)
+        byte[] buffer = new byte[2048];
+
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using var tcp = new TcpClient();
+                _log.LogInformation("Connecting to scale {Host}:{Port} ...", _opt.Host, _opt.Port);
+
+                await tcp.ConnectAsync(_opt.Host, _opt.Port, stoppingToken);
+
+                if (!tcp.Connected)
+                {
+                    _log.LogWarning("Scale connection failed.");
+                    await Task.Delay(_opt.ReconnectDelayMs, stoppingToken);
+                    continue;
+                }
+
+                tcp.ReceiveTimeout = _opt.ReadTimeoutMs;
+                _log.LogInformation("Scale connected to {Host}:{Port}", _opt.Host, _opt.Port);
+
+                using var stream = tcp.GetStream();
+
+                // Flush any garbage already buffered
+                while (stream.DataAvailable)
+                {
+                    await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), stoppingToken);
+                }
+
+                var pending = new List<byte>(8192);
+
+                decimal lastValue = 0m;
+                int stableCounter = 0;
+                bool haveLast = false;
+
+                while (!stoppingToken.IsCancellationRequested)
+                {
+                    int bytesRead = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), stoppingToken);
+                    if (bytesRead <= 0) throw new IOException("Scale closed connection.");
+
+                    for (int i = 0; i < bytesRead; i++) pending.Add(buffer[i]);
+
+                    while (true)
+                    {
+                        int stx = pending.IndexOf(0x02);
+                        if (stx < 0)
+                        {
+                            pending.Clear();
+                            break;
+                        }
+
+                        if (stx > 0) pending.RemoveRange(0, stx);
+
+                        int cr = pending.IndexOf(0x0D, startIndex: 1);
+                        if (cr < 0) break;
+
+                        var payloadBytes = pending.GetRange(1, cr - 1).ToArray();
+                        pending.RemoveRange(0, cr + 1);
+
+                        if (pending.Count > 0 && pending[0] != 0x02)
+                            pending.RemoveAt(0);
+
+                        string line = Encoding.ASCII.GetString(payloadBytes).Trim();
+                        if (line.Length == 0) continue;
+
+                        if (!WeightParser.TryParseWeight(line, _opt.MinDigits, out var raw))
+                            continue;
+
+                        var current = raw / _opt.Divisor;
+
+                        if (haveLast && Math.Abs(current - lastValue) < 0.01m)
+                            stableCounter++;
+                        else
+                            stableCounter = 1;
+
+                        bool isStable = stableCounter >= 15 && current >= 2000m;
+
+                        Console.WriteLine("Current Weight: " + current);
+
+                        if (current >= 2000m)
+                            await PublishAsync(current, isStable, stoppingToken);
+
+                        lastValue = current;
+                        haveLast = true;
+                    }
+
+                    if (pending.Count > 100_000) pending.Clear();
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Scale loop error; reconnecting in {ms}ms...", _opt.ReconnectDelayMs);
+                try { await Task.Delay(_opt.ReconnectDelayMs, stoppingToken); } catch { }
+            }
+        }
+    }
+
+    private async Task PublishAsync(decimal weightKg, bool isStable, CancellationToken ct)
+    {
+        _weightState.Update(weightKg, isStable, DateTime.UtcNow);
+        await _pub.PublishWeightAsync(weightKg, isStable, ct);
+    }
+}
+
+static class ByteListExtensions
+{
+    public static int IndexOf(this List<byte> data, byte value, int startIndex = 0)
+    {
+        for (int i = startIndex; i < data.Count; i++)
+            if (data[i] == value) return i;
+        return -1;
+    }
+}
+
+#endregion
+
+#region HTTP DTOs
+
+public sealed record SendSlvRequest(string rfidCard);
 
 #endregion
 
@@ -772,47 +861,59 @@ public class Program
 {
     public static async Task Main(string[] args)
     {
-        var configuration = ConfigLoader.BuildWithEmbeddedFallback();
-
         var builder = WebApplication.CreateBuilder(args);
-        builder.Configuration.AddConfiguration(configuration);
 
-        // Options Binding
+        builder.Configuration
+            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+            .AddEnvironmentVariables();
+
+        // Options
         builder.Services.Configure<AppOptions>(builder.Configuration.GetSection("App"));
         builder.Services.Configure<RfidOptions>(builder.Configuration.GetSection("Rfid"));
-        builder.Services.Configure<DeviceOptions>(builder.Configuration.GetSection("Device"));
+        builder.Services.Configure<ScaleOptions>(builder.Configuration.GetSection("Scale"));
+
         builder.Services.Configure<DbOptions>(opt =>
         {
-            opt.ConnectionString =
-                builder.Configuration.GetConnectionString("SqlServer")
+            opt.ConnectionString = builder.Configuration.GetConnectionString("SqlServer")
                 ?? throw new InvalidOperationException("ConnectionStrings:SqlServer missing");
 
-            var table = builder.Configuration["Db:TagsTable"];
-            if (!string.IsNullOrWhiteSpace(table))
-                opt.TagsTable = table!;
+            var t1 = builder.Configuration["Db:ClientEquipementsTable"];
+            if (!string.IsNullOrWhiteSpace(t1)) opt.ClientEquipementsTable = t1!;
 
-            var legend = builder.Configuration["Db:OrderLegendTable"];
-            if (!string.IsNullOrWhiteSpace(legend))
-                opt.OrderLegendTable = legend!;
+            var t2 = builder.Configuration["Db:OrderLegendTable"];
+            if (!string.IsNullOrWhiteSpace(t2)) opt.OrderLegendTable = t2!;
         });
-        builder.Services.Configure<SignalROptions>(builder.Configuration.GetSection("SignalR"));
 
-        // Core Services
+        builder.Services.AddOptions<SignalROptions>()
+            .Bind(builder.Configuration.GetSection("SignalR"))
+            .Validate(o => !string.IsNullOrWhiteSpace(o.ConnectionString), "SignalR:ConnectionString missing")
+            .Validate(o => o.Targets is not null && o.Targets.Count > 0, "SignalR:Targets missing")
+            .ValidateOnStart();
+
+        // Shared state
+        builder.Services.AddSingleton<IStepState, StepState>();
+        builder.Services.AddSingleton<IWeightState, WeightState>();
+
+        // Azure SignalR ServiceManager (shared)
+        builder.Services.AddSingleton(sp =>
+        {
+            var sro = sp.GetRequiredService<IOptions<SignalROptions>>().Value;
+            return new ServiceManagerBuilder()
+                .WithOptions(o => o.ConnectionString = sro.ConnectionString)
+                .BuildServiceManager();
+        });
+
+        // Services
         builder.Services.AddSingleton<RfidService>();
-        builder.Services.AddSingleton<IClientEquipementRepository, ClientEquipementRepository>();
-        builder.Services.AddSingleton<SignalRPublisher>();
+        builder.Services.AddSingleton<IRepository, Repository>();
+        builder.Services.AddSingleton<SignalRRouterPublisher>();
         builder.Services.AddSingleton<RfidResolverService>();
 
-        // Hosted Services (ordering preserved)
-        builder.Services.AddHostedService(sp => sp.GetRequiredService<SignalRPublisher>());
-        builder.Services.AddHostedService<DeviceRegistrationService>();
-
-        var appOptions = configuration.GetSection("App").Get<AppOptions>() ?? new AppOptions();
-
-        if (!appOptions.TestMode)
-            builder.Services.AddHostedService(sp => sp.GetRequiredService<RfidService>());
-
+        // Hosted services
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<SignalRRouterPublisher>());
+        builder.Services.AddHostedService(sp => sp.GetRequiredService<RfidService>());
         builder.Services.AddHostedService(sp => sp.GetRequiredService<RfidResolverService>());
+        builder.Services.AddHostedService<WeightBridgeService>();
 
         // Logging
         builder.Logging.ClearProviders();
@@ -823,128 +924,82 @@ public class Program
         });
         builder.Logging.SetMinimumLevel(LogLevel.Information);
 
-        // HTTP Server + CORS
-        var httpPort = configuration.GetValue<int>("App:HttpPort", 5002);
-        builder.WebHost.UseUrls($"http://0.0.0.0:{httpPort}");
+        // HTTP port
+        var httpPort = builder.Configuration.GetValue<int>("App:HttpPort", 5001);
+        builder.WebHost.UseUrls($"http://localhost:{httpPort}");
+
         builder.Services.AddCors();
 
         var app = builder.Build();
+        app.UseCors(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
 
-        app.Use(async (ctx, next) =>
-        {
-            var origin = ctx.Request.Headers["Origin"];
-
-            ctx.Response.Headers.Add("Access-Control-Allow-Origin",
-                string.IsNullOrEmpty(origin) ? "*" : origin);
-
-            ctx.Response.Headers.Add("Vary", "Origin");
-            ctx.Response.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            ctx.Response.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
-
-            if (ctx.Request.Method.Equals("OPTIONS", StringComparison.OrdinalIgnoreCase))
-            {
-                ctx.Response.StatusCode = StatusCodes.Status204NoContent;
-                return;
-            }
-
-            await next();
-        });
-
-        // GET: /device-id
+        // GET /device-id
         app.MapGet("/device-id", () =>
         {
-            var deviceId = DeviceIdentity.GetOrCreateDeviceId();
-
-            return Results.Json(new
-            {
-                deviceId,
-                filePath = DeviceIdentity.GetDeviceIdPath(),
-                timestamp = DateTime.UtcNow
-            });
+            var deviceId = DeviceIdManager.GetOrCreateDeviceId();
+            var filePath = DeviceIdManager.GetDeviceIdFilePath();
+            return Results.Json(new { deviceId, filePath, timestamp = DateTime.UtcNow });
         });
 
-        // GET: /device-info
-        app.MapGet("/device-info", (IOptions<DeviceOptions> devOpt) =>
+        // GET /status
+        app.MapGet("/status", (IStepState step, IWeightState weight) =>
         {
-            var deviceId = DeviceIdentity.GetOrCreateDeviceId();
-            var deviceName = DeviceIdentity.GetOrCreateDeviceName(devOpt.Value.Name);
-
+            var s = step.Snapshot();
+            var w = weight.Snapshot();
             return Results.Json(new
             {
-                deviceId,
-                deviceName,
-                idFile = DeviceIdentity.GetDeviceIdPath(),
-                nameFile = DeviceIdentity.GetDeviceNamePath(),
-                hostName = Environment.MachineName,
-                timestamp = DateTime.UtcNow
+                step = s.step,
+                rfidCard = s.card,
+                rfidAtUtc = s.atUtc,
+                lastWeightKg = w.weightKg,
+                lastWeightStable = w.isStable,
+                lastWeightAtUtc = w.atUtc,
+                nowUtc = DateTime.UtcNow
             });
         });
 
-        // POST: /send-slv (publishes SLV; now also routes by Step from Ecare_Order_Legend)
+        // POST /send-slv  { "rfidCard": "4421" }
         app.MapPost("/send-slv", async (
-            SlvRequest req,
-            IClientEquipementRepository repo,
-            SignalRPublisher publisher) =>
+            SendSlvRequest req,
+            IRepository repo,
+            IStepState stepState,
+            SignalRRouterPublisher pub,
+            ILoggerFactory lf,
+            CancellationToken ct) =>
         {
-            if (req is null || string.IsNullOrWhiteSpace(req.Slv))
-                return Results.BadRequest(new { error = "Missing SLV" });
+            var log = lf.CreateLogger("SendSlv");
 
-            var slv = req.Slv.Trim();
+            if (req is null || string.IsNullOrWhiteSpace(req.rfidCard))
+                return Results.BadRequest(new { error = "rfidCard is required" });
 
-            int? step = null;
-            try { step = await repo.GetStepByRfidCardAsync(slv, CancellationToken.None); }
-            catch { /* keep step null */ }
+            var card = req.rfidCard.Trim();
 
-            await publisher.PublishRfidAsync(slv, step);
+            var step = await repo.GetStepByRfidCardAsync(card, ct);
+            stepState.Update(card, step, DateTime.UtcNow);
 
-            return Results.Json(new
+            await pub.PublishRfidCardAsync(card, step, ct);
+
+            log.LogInformation("Manual /send-slv rfidCard={card} step={step}", card, step);
+
+            return Results.Ok(new
             {
-                sent = true,
-                slv,
+                rfidCard = card,
                 step,
-                routedTo = (step == 4) ? "EXIT" : "ENTRY",
-                timestamp = DateTime.UtcNow
+                nowUtc = DateTime.UtcNow
             });
         });
 
         // Root
-        app.MapGet("/", () =>
+        app.MapGet("/", () => Results.Json(new
         {
-            return Results.Json(new
-            {
-                message = "RFID Service API",
-                endpoints = new[]
-                {
-                    "/device-id",
-                    "/device-info",
-                    "/send-slv"
-                }
-            });
-        });
+            message = "Merged RFID + Weight → Azure SignalR (step-routed)",
+            endpoints = new[] { "/device-id", "/status", "/send-slv" }
+        }));
 
-        Console.WriteLine("RFID → SQL (CarteSLV) → Step → Azure SignalR (ENTRY/EXIT)");
-        Console.WriteLine($"HTTP API: http://localhost:{httpPort}");
-        Console.WriteLine($"Device ID file:   {DeviceIdentity.GetDeviceIdPath()}");
-        Console.WriteLine($"Device Name file: {DeviceIdentity.GetDeviceNamePath()}");
+        Console.WriteLine("Merged RFID + Weight → Azure SignalR (step-routed)");
+        Console.WriteLine($"HTTP API listening on http://localhost:{httpPort}");
+        Console.WriteLine($"Device ID file: {DeviceIdManager.GetDeviceIdFilePath()}");
         Console.WriteLine("Ctrl+C to exit.");
-
-        // Get local IPv4 address (LAN IP)
-        string localIp = "localhost";
-        try
-        {
-            localIp = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName())
-                .AddressList
-                .FirstOrDefault(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)?
-                .ToString() ?? "localhost";
-        }
-        catch { }
-
-        // PRINT FULL URLs
-        Console.WriteLine("==========================================");
-        Console.WriteLine($"Local IP detected: {localIp}");
-        Console.WriteLine($"HTTP API     : http://{localIp}:{httpPort}");
-        Console.WriteLine($"POST SLV     : http://{localIp}:{httpPort}/send-slv");
-        Console.WriteLine("==========================================");
 
         await app.RunAsync();
     }
