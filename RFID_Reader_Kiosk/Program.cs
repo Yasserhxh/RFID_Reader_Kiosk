@@ -37,7 +37,7 @@ public sealed class AppOptions
 
 public sealed class RfidOptions
 {
-    public string Host { get; set; } = "10.116.136.22";
+    public string Host { get; set; } = "10.8.197.20";
     public int Port { get; set; } = 4001;
     public int ReconnectDelayMs { get; set; } = 2000;
     public int ReadBufferBytes { get; set; } = 4096;
@@ -48,7 +48,7 @@ public sealed class RfidOptions
 public sealed class DbOptions
 {
     public string ConnectionString { get; set; } = default!;
-    public string ClientEquipementsTable { get; set; } = "dbo.Ecare_ClientEquipements";
+    public string ClientEquipementsTable { get; set; } = "dbo.Ecare_Tags";
 }
 
 public sealed class SignalROptions
