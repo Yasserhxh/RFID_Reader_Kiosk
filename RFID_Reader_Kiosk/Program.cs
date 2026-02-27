@@ -16,8 +16,10 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using System.Buffers;
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Reflection;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -33,8 +35,8 @@ public sealed class AppOptions
 
 public sealed class RfidOptions
 {
-    public string Host { get; set; } = "10.116.136.22";
-    public string? FallbackHost { get; set; } = "10.8.197.20";
+    public string Host { get; set; } = "10.8.197.14";
+    public string? FallbackHost { get; set; } = "10.8.197.14";
     public int Port { get; set; } = 4001;
     public int ReconnectDelayMs { get; set; } = 2000;
     public int ReadBufferBytes { get; set; } = 4096;
@@ -51,8 +53,8 @@ public sealed class DbOptions
 public sealed class SignalROptions
 {
     public string ConnectionString { get; set; } = default!;
-    public string HubName { get; set; } = "slv_pabentry_hub";
-    public string MethodName { get; set; } = "ReceivePabEntryRfid";
+    public string HubName { get; set; } = "slv_hub";
+    public string MethodName { get; set; } = "ReceiveRfid";
 }
 
 public sealed class DeviceOptions
@@ -846,32 +848,117 @@ public class Program
         });
 
         Console.WriteLine("RFID → SQL (CarteSLV) → Azure SignalR");
-        Console.WriteLine($"HTTP API: http://localhost:{httpPort}");
-        Console.WriteLine($"Device ID file:   {DeviceIdentity.GetDeviceIdPath()}");
-        Console.WriteLine($"Device Name file: {DeviceIdentity.GetDeviceNamePath()}");
-        Console.WriteLine("Ctrl+C to exit.");
+            Console.WriteLine($"HTTP API: http://localhost:{httpPort}");
+            Console.WriteLine($"Device ID file:   {DeviceIdentity.GetDeviceIdPath()}");
+            Console.WriteLine($"Device Name file: {DeviceIdentity.GetDeviceNamePath()}");
+            Console.WriteLine("Ctrl+C to exit.");
 
-        // Get local IPv4 address (LAN IP)
-        string localIp = "localhost";
+            // Get local IPv4 address (LAN IP)
+            string localIp = "localhost";
+            try
+            {
+                localIp = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName())
+                    .AddressList
+                    .FirstOrDefault(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)?
+                    .ToString() ?? "localhost";
+            }
+            catch { }
+
+            // PRINT FULL URLs
+            Console.WriteLine("==========================================");
+            Console.WriteLine($"Local IP detected: {localIp}");
+            Console.WriteLine($"HTTP API     : http://{localIp}:{httpPort}");
+            Console.WriteLine($"POST SLV     : http://{localIp}:{httpPort}/send-slv");
+            Console.WriteLine("==========================================");
+
         try
         {
-            localIp = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName())
-                .AddressList
-                .FirstOrDefault(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)?
-                .ToString() ?? "localhost";
+            WindowsFirewall.EnsureAllowInboundTcpForCurrentExeOnPort(
+                httpPort,
+                ruleName: $"RFID Service API (TCP {httpPort})",
+                includeDomainProfile: true,
+                includePrivateProfile: true);
+            Console.WriteLine("Windows Firewall rule added.");
+            Console.WriteLine("If you see a Windows Firewall prompt, please allow it to enable API access.");
         }
-        catch { }
-
-        // PRINT FULL URLs
-        Console.WriteLine("==========================================");
-        Console.WriteLine($"Local IP detected: {localIp}");
-        Console.WriteLine($"HTTP API     : http://{localIp}:{httpPort}");
-        Console.WriteLine($"POST SLV     : http://{localIp}:{httpPort}/send-slv");
-        Console.WriteLine("==========================================");
-
-
+        catch (Exception ex)
+        {
+            // If not admin, Windows will keep prompting. Log and continue.
+            app.Logger.LogWarning(ex, "Could not create Windows Firewall rule (admin required).");
+        }
         await app.RunAsync();
+        }
     }
-}
+
+#endregion
+
+#region Windows Firewall Helper (Windows only)
+
+    public static class WindowsFirewall
+    {
+        // Profiles bitmask used by INetFwRule.Profiles
+        private const int PROFILE_DOMAIN = 1;
+        private const int PROFILE_PRIVATE = 2;
+        private const int PROFILE_PUBLIC = 4;
+
+        public static void EnsureAllowInboundTcpForCurrentExeOnPort(
+            int port,
+            string ruleName,
+            bool includeDomainProfile = true,
+            bool includePrivateProfile = true)
+        {
+            if (!OperatingSystem.IsWindows())
+                return;
+
+            if (!IsAdministrator())
+                throw new InvalidOperationException("Firewall rule creation requires Administrator privileges.");
+
+            var exePath = Environment.ProcessPath
+                ?? Process.GetCurrentProcess().MainModule?.FileName
+                ?? throw new InvalidOperationException("Cannot resolve current process path.");
+
+            dynamic policy2 = Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2")!)
+                ?? throw new InvalidOperationException("Cannot create HNetCfg.FwPolicy2 (firewall COM).");
+
+            // Avoid duplicates (same rule name)
+            foreach (dynamic r in policy2.Rules)
+            {
+                string name = r.Name;
+                if (string.Equals(name, ruleName, StringComparison.OrdinalIgnoreCase))
+                    return; // already exists
+            }
+
+            dynamic rule = Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FWRule")!)
+                ?? throw new InvalidOperationException("Cannot create HNetCfg.FWRule.");
+
+            rule.Name = ruleName;
+            rule.Description = "Auto-added by app to avoid Windows Firewall prompt.";
+            rule.ApplicationName = exePath;
+
+            rule.Protocol = 6;                 // TCP
+            rule.LocalPorts = port.ToString(); // limit to your HTTP port
+            rule.Direction = 1;                // Inbound
+            rule.Action = 1;                   // Allow
+            rule.Enabled = true;
+            rule.InterfaceTypes = "All";
+
+            int profiles = 0;
+            if (includeDomainProfile) profiles |= PROFILE_DOMAIN;
+            if (includePrivateProfile) profiles |= PROFILE_PRIVATE;
+            // Do NOT include public unless you really want it:
+            // profiles |= PROFILE_PUBLIC;
+
+            rule.Profiles = profiles;
+
+            policy2.Rules.Add(rule);
+        }
+
+        private static bool IsAdministrator()
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var principal = new WindowsPrincipal(identity);
+            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+    }
 
 #endregion
